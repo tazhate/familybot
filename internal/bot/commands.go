@@ -29,6 +29,8 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message, user *domain.User) {
 		b.cmdToday(chatID, user)
 	case "reminders":
 		b.cmdReminders(chatID, user)
+	case "menu":
+		b.cmdMenu(chatID, user)
 	default:
 		b.SendMessage(chatID, "Неизвестная команда. /help для списка команд")
 	}
@@ -40,11 +42,12 @@ func (b *Bot) cmdStart(msg *tgbotapi.Message) {
 
 	user, _ := b.storage.GetUserByTelegramID(userID)
 	if user != nil {
-		b.SendMessage(chatID, fmt.Sprintf("👋 С возвращением, %s!", user.Name))
+		text := fmt.Sprintf("👋 С возвращением, %s!", user.Name)
+		kb := mainMenuKeyboard()
+		b.SendMessageWithKeyboard(chatID, text, kb)
 		return
 	}
 
-	// Создаём пользователя
 	name := msg.From.FirstName
 	if msg.From.LastName != "" {
 		name += " " + msg.From.LastName
@@ -66,11 +69,13 @@ func (b *Bot) cmdStart(msg *tgbotapi.Message) {
 		return
 	}
 
-	b.SendMessage(chatID, fmt.Sprintf("👋 Привет, %s!\n\nЯ помогу управлять задачами и напоминаниями.\n\n/help — список команд", name))
+	text := fmt.Sprintf("👋 Привет, %s!\n\nЯ помогу управлять задачами и напоминаниями.", name)
+	kb := mainMenuKeyboard()
+	b.SendMessageWithKeyboard(chatID, text, kb)
 }
 
 func (b *Bot) cmdHelp(chatID int64) {
-	text := `<b>Команды:</b>
+	text := `<b>📚 Команды:</b>
 
 <b>Задачи</b>
 /add текст — добавить задачу
@@ -81,12 +86,38 @@ func (b *Bot) cmdHelp(chatID int64) {
 <b>Напоминания</b>
 /reminders — список напоминаний
 
-<b>Другое</b>
+<b>Навигация</b>
+/menu — главное меню
 /help — эта справка
 
-💡 Просто отправь текст — добавлю как задачу`
+💡 <i>Просто отправь текст — добавлю как задачу</i>`
 
-	b.SendMessage(chatID, text)
+	kb := mainMenuKeyboard()
+	b.SendMessageWithKeyboard(chatID, text, kb)
+}
+
+func (b *Bot) cmdMenu(chatID int64, user *domain.User) {
+	if user == nil {
+		b.SendMessage(chatID, "Сначала /start")
+		return
+	}
+
+	tasks, _ := b.taskService.List(user.ID, false)
+	urgentCount := 0
+	for _, t := range tasks {
+		if t.Priority == domain.PriorityUrgent {
+			urgentCount++
+		}
+	}
+
+	text := "<b>📱 Главное меню</b>\n\n"
+	text += fmt.Sprintf("Активных задач: <b>%d</b>", len(tasks))
+	if urgentCount > 0 {
+		text += fmt.Sprintf(" (срочных: %d 🔴)", urgentCount)
+	}
+
+	kb := mainMenuKeyboard()
+	b.SendMessageWithKeyboard(chatID, text, kb)
 }
 
 func (b *Bot) cmdAdd(chatID int64, user *domain.User, args string) {
@@ -96,37 +127,47 @@ func (b *Bot) cmdAdd(chatID int64, user *domain.User, args string) {
 	}
 
 	if args == "" {
-		b.SendMessage(chatID, "Укажи текст задачи: /add Купить молоко")
+		b.SendMessage(chatID, "Напиши текст задачи:")
 		return
 	}
 
 	// Парсим приоритет из тегов
-	priority := domain.PrioritySomeday
-	if strings.Contains(args, "!срочно") || strings.Contains(args, "!urgent") {
+	priority := domain.Priority("")
+	if strings.Contains(args, "!срочно") || strings.Contains(args, "!urgent") || strings.Contains(args, "!1") {
 		priority = domain.PriorityUrgent
 		args = strings.ReplaceAll(args, "!срочно", "")
 		args = strings.ReplaceAll(args, "!urgent", "")
-	} else if strings.Contains(args, "!неделя") || strings.Contains(args, "!week") {
+		args = strings.ReplaceAll(args, "!1", "")
+	} else if strings.Contains(args, "!неделя") || strings.Contains(args, "!week") || strings.Contains(args, "!2") {
 		priority = domain.PriorityWeek
 		args = strings.ReplaceAll(args, "!неделя", "")
 		args = strings.ReplaceAll(args, "!week", "")
+		args = strings.ReplaceAll(args, "!2", "")
+	} else if strings.Contains(args, "!потом") || strings.Contains(args, "!someday") || strings.Contains(args, "!3") {
+		priority = domain.PrioritySomeday
+		args = strings.ReplaceAll(args, "!потом", "")
+		args = strings.ReplaceAll(args, "!someday", "")
+		args = strings.ReplaceAll(args, "!3", "")
 	}
 
-	task, err := b.taskService.Create(user.ID, strings.TrimSpace(args), priority)
+	args = strings.TrimSpace(args)
+
+	// Если приоритет не указан — показываем выбор
+	if priority == "" {
+		kb := priorityKeyboard(args)
+		b.SendMessageWithKeyboard(chatID, "Выбери приоритет:\n\n<b>"+args+"</b>", kb)
+		return
+	}
+
+	task, err := b.taskService.Create(user.ID, args, priority)
 	if err != nil {
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
 
-	text := fmt.Sprintf("✅ Задача добавлена\n\n%s #%d %s", task.PriorityEmoji(), task.ID, task.Title)
-
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("✅ Выполнено", fmt.Sprintf("done:%d", task.ID)),
-		),
-	)
-
-	b.SendMessageWithKeyboard(chatID, text, keyboard)
+	text := fmt.Sprintf("✅ Задача добавлена\n\n%s <b>#%d</b> %s", task.PriorityEmoji(), task.ID, task.Title)
+	kb := taskKeyboard(task.ID)
+	b.SendMessageWithKeyboard(chatID, text, kb)
 }
 
 func (b *Bot) cmdList(chatID int64, user *domain.User) {
@@ -141,13 +182,24 @@ func (b *Bot) cmdList(chatID int64, user *domain.User) {
 		return
 	}
 
-	text := "<b>📋 Задачи:</b>\n\n" + b.taskService.FormatTaskList(tasks)
-
-	if len(tasks) > 0 {
-		keyboard := b.buildTaskListKeyboard(tasks)
-		b.SendMessageWithKeyboard(chatID, text, *keyboard)
+	text := "<b>📋 Задачи</b>\n\n"
+	if len(tasks) == 0 {
+		text += "Нет активных задач 🎉\n\nНажми ➕ чтобы добавить"
 	} else {
-		b.SendMessage(chatID, text)
+		text += b.taskService.FormatTaskList(tasks)
+	}
+
+	kb := taskListKeyboard(tasks, 0)
+	if kb != nil {
+		b.SendMessageWithKeyboard(chatID, text, *kb)
+	} else {
+		// Empty state keyboard
+		emptyKb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("➕ Добавить задачу", "add"),
+			),
+		)
+		b.SendMessageWithKeyboard(chatID, text, emptyKb)
 	}
 }
 
@@ -173,7 +225,13 @@ func (b *Bot) cmdDone(chatID int64, user *domain.User, args string) {
 		return
 	}
 
-	b.SendMessage(chatID, "✅ Задача #"+args+" выполнена!")
+	text := "✅ Задача <b>#" + args + "</b> выполнена!"
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📋 К списку", "menu:list"),
+		),
+	)
+	b.SendMessageWithKeyboard(chatID, text, kb)
 }
 
 func (b *Bot) cmdToday(chatID int64, user *domain.User) {
@@ -188,8 +246,19 @@ func (b *Bot) cmdToday(chatID int64, user *domain.User) {
 		return
 	}
 
-	text := "<b>📅 На сегодня:</b>\n\n" + b.taskService.FormatTaskList(tasks)
-	b.SendMessage(chatID, text)
+	text := "<b>📅 На сегодня</b>\n\n"
+	if len(tasks) == 0 {
+		text += "На сегодня задач нет! 🎉"
+	} else {
+		text += b.taskService.FormatTaskList(tasks)
+	}
+
+	kb := todayKeyboard(tasks)
+	if kb != nil {
+		b.SendMessageWithKeyboard(chatID, text, *kb)
+	} else {
+		b.SendMessage(chatID, text)
+	}
 }
 
 func (b *Bot) cmdReminders(chatID int64, user *domain.User) {
@@ -204,35 +273,14 @@ func (b *Bot) cmdReminders(chatID int64, user *domain.User) {
 		return
 	}
 
-	text := "<b>🔔 Напоминания:</b>\n\n" + b.reminderService.FormatReminderList(reminders)
-	b.SendMessage(chatID, text)
-}
+	text := "<b>🔔 Напоминания</b>\n\n" + b.reminderService.FormatReminderList(reminders)
 
-func (b *Bot) buildTaskListKeyboard(tasks []*domain.Task) *tgbotapi.InlineKeyboardMarkup {
-	var rows [][]tgbotapi.InlineKeyboardButton
-
-	for _, t := range tasks {
-		if t.IsDone() {
-			continue
-		}
-		row := tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData(
-				fmt.Sprintf("✅ #%d %s", t.ID, truncate(t.Title, 20)),
-				fmt.Sprintf("done:%d", t.ID),
-			),
-		)
-		rows = append(rows, row)
-		if len(rows) >= 5 {
-			break
-		}
-	}
-
-	if len(rows) == 0 {
-		return nil
-	}
-
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
-	return &keyboard
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📋 К задачам", "menu:list"),
+		),
+	)
+	b.SendMessageWithKeyboard(chatID, text, kb)
 }
 
 func truncate(s string, maxLen int) string {
