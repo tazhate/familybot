@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: familybot-config
+  namespace: familybot
+data:
+  DATABASE_PATH: "/data/familybot.db"
+  TIMEZONE: "Europe/Moscow"
+  MORNING_TIME: "09:00"
+  EVENING_TIME: "21:00"
+  WEBHOOK_URL: "https://family.tazhate.com"
+  SERVER_PORT: "8080"

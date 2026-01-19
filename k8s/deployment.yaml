@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: familybot
+  namespace: familybot
+  labels:
+    app: familybot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: familybot
+  template:
+    metadata:
+      labels:
+        app: familybot
+    spec:
+      containers:
+        - name: familybot
+          image: registry.tazhate.com/familybot:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          envFrom:
+            - secretRef:
+                name: familybot-secrets
+            - configMapRef:
+                name: familybot-config
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: familybot-data

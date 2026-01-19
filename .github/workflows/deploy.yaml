@@ -1,0 +1,37 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Build and push Docker image
+        run: |
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login registry.tazhate.com -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin
+          docker build -t registry.tazhate.com/familybot:${{ github.sha }} -t registry.tazhate.com/familybot:latest .
+          docker push registry.tazhate.com/familybot:${{ github.sha }}
+          docker push registry.tazhate.com/familybot:latest
+
+      - name: Deploy to Kubernetes
+        uses: steebchen/kubectl@v2.0.0
+        with:
+          config: ${{ secrets.KUBE_CONFIG }}
+          command: -n familybot set image deploy/familybot familybot=registry.tazhate.com/familybot:${{ github.sha }}
+
+      - name: Verify deployment
+        uses: steebchen/kubectl@v2.0.0
+        with:
+          config: ${{ secrets.KUBE_CONFIG }}
+          command: -n familybot rollout status deploy/familybot --timeout=120s
