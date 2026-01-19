@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/robfig/cron/v3"
 	"github.com/tazhate/familybot/config"
@@ -43,14 +44,14 @@ func (s *Scheduler) SetSender(sender MessageSender) {
 }
 
 func (s *Scheduler) Start(ctx context.Context) error {
-	// Утренний брифинг
-	morningSpec := fmt.Sprintf("0 %s * * *", s.cfg.MorningTime)
+	// Утренний брифинг (парсим "09:00" -> "0 9 * * *")
+	morningSpec := timeToCron(s.cfg.MorningTime)
 	if _, err := s.cron.AddFunc(morningSpec, s.morningBriefing); err != nil {
 		return fmt.Errorf("add morning briefing: %w", err)
 	}
 
 	// Вечерний чекин
-	eveningSpec := fmt.Sprintf("0 %s * * *", s.cfg.EveningTime)
+	eveningSpec := timeToCron(s.cfg.EveningTime)
 	if _, err := s.cron.AddFunc(eveningSpec, s.eveningCheckin); err != nil {
 		return fmt.Errorf("add evening checkin: %w", err)
 	}
@@ -185,5 +186,23 @@ func (s *Scheduler) checkReminders() {
 			log.Printf("Error marking reminder %d as sent: %v", r.ID, err)
 		}
 	}
+}
+
+// timeToCron converts "HH:MM" to cron spec "MM HH * * *"
+func timeToCron(timeStr string) string {
+	parts := strings.Split(timeStr, ":")
+	if len(parts) != 2 {
+		return "0 9 * * *" // default 9:00
+	}
+	// Remove leading zeros for cron compatibility
+	hour := strings.TrimLeft(parts[0], "0")
+	if hour == "" {
+		hour = "0"
+	}
+	minute := strings.TrimLeft(parts[1], "0")
+	if minute == "" {
+		minute = "0"
+	}
+	return fmt.Sprintf("%s %s * * *", minute, hour)
 }
 
