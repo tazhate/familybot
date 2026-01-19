@@ -31,6 +31,12 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message, user *domain.User) {
 		b.cmdReminders(chatID, user)
 	case "menu":
 		b.cmdMenu(chatID, user)
+	case "people":
+		b.cmdPeople(chatID, user)
+	case "addperson":
+		b.cmdAddPerson(chatID, user, args)
+	case "birthdays":
+		b.cmdBirthdays(chatID, user)
 	default:
 		b.SendMessage(chatID, "Неизвестная команда. /help для списка команд")
 	}
@@ -83,6 +89,11 @@ func (b *Bot) cmdHelp(chatID int64) {
 /done ID — выполнить задачу
 /today — задачи на сегодня
 
+<b>Люди</b>
+/people — список людей
+/addperson Имя роль ДД.ММ.ГГГГ
+/birthdays — ближайшие ДР
+
 <b>Напоминания</b>
 /reminders — список напоминаний
 
@@ -90,7 +101,8 @@ func (b *Bot) cmdHelp(chatID int64) {
 /menu — главное меню
 /help — эта справка
 
-💡 <i>Просто отправь текст — добавлю как задачу</i>`
+💡 <i>Просто отправь текст — добавлю как задачу</i>
+💡 <i>Роли: ребёнок, семья, контакт</i>`
 
 	kb := mainMenuKeyboard()
 	b.SendMessageWithKeyboard(chatID, text, kb)
@@ -278,6 +290,101 @@ func (b *Bot) cmdReminders(chatID int64, user *domain.User) {
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("📋 К задачам", "menu:list"),
+		),
+	)
+	b.SendMessageWithKeyboard(chatID, text, kb)
+}
+
+func (b *Bot) cmdPeople(chatID int64, user *domain.User) {
+	if user == nil {
+		b.SendMessage(chatID, "Сначала /start")
+		return
+	}
+
+	persons, err := b.personService.List(user.ID)
+	if err != nil {
+		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+		return
+	}
+
+	text := "<b>👥 Люди</b>\n\n"
+	if len(persons) == 0 {
+		text += "Список пуст.\n\nДобавь: /addperson Тим ребёнок 12.06.2017"
+	} else {
+		text += b.personService.FormatPersonList(persons)
+	}
+
+	kb := peopleKeyboard(persons)
+	b.SendMessageWithKeyboard(chatID, text, kb)
+}
+
+func (b *Bot) cmdAddPerson(chatID int64, user *domain.User, args string) {
+	if user == nil {
+		b.SendMessage(chatID, "Сначала /start")
+		return
+	}
+
+	if args == "" {
+		text := `<b>Добавить человека:</b>
+
+/addperson Имя роль ДД.ММ.ГГГГ
+
+<b>Примеры:</b>
+/addperson Тим ребёнок 12.06.2017
+/addperson Ира семья 17.12
+/addperson Федя контакт
+
+<b>Роли:</b> ребёнок, семья, контакт`
+		b.SendMessage(chatID, text)
+		return
+	}
+
+	name, role, birthday, err := b.personService.ParseAddPersonArgs(args)
+	if err != nil {
+		b.SendMessage(chatID, "❌ "+err.Error())
+		return
+	}
+
+	person, err := b.personService.Create(user.ID, name, role, birthday, "")
+	if err != nil {
+		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+		return
+	}
+
+	text := fmt.Sprintf("✅ Добавлен: %s <b>%s</b>", person.RoleEmoji(), person.Name)
+	if person.HasBirthday() {
+		text += fmt.Sprintf("\n🎂 %s", person.Birthday.Format("02.01.2006"))
+	}
+
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👥 К списку", "menu:people"),
+			tgbotapi.NewInlineKeyboardButtonData("🎂 Дни рождения", "menu:birthdays"),
+		),
+	)
+	b.SendMessageWithKeyboard(chatID, text, kb)
+}
+
+func (b *Bot) cmdBirthdays(chatID int64, user *domain.User) {
+	if user == nil {
+		b.SendMessage(chatID, "Сначала /start")
+		return
+	}
+
+	// Показываем ДР на ближайшие 60 дней
+	persons, err := b.personService.ListUpcomingBirthdays(user.ID, 60)
+	if err != nil {
+		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+		return
+	}
+
+	text := "<b>🎂 Ближайшие дни рождения</b>\n\n"
+	text += b.personService.FormatBirthdaysList(persons)
+
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👥 Все люди", "menu:people"),
+			tgbotapi.NewInlineKeyboardButtonData("📋 Задачи", "menu:list"),
 		),
 	)
 	b.SendMessageWithKeyboard(chatID, text, kb)

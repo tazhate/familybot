@@ -18,10 +18,11 @@ type Bot struct {
 	storage         *storage.Storage
 	taskService     *service.TaskService
 	reminderService *service.ReminderService
+	personService   *service.PersonService
 	server          *http.Server
 }
 
-func New(cfg *config.Config, storage *storage.Storage, taskSvc *service.TaskService, reminderSvc *service.ReminderService) (*Bot, error) {
+func New(cfg *config.Config, storage *storage.Storage, taskSvc *service.TaskService, reminderSvc *service.ReminderService, personSvc *service.PersonService) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
 	if err != nil {
 		return nil, fmt.Errorf("create bot api: %w", err)
@@ -35,6 +36,7 @@ func New(cfg *config.Config, storage *storage.Storage, taskSvc *service.TaskServ
 		storage:         storage,
 		taskService:     taskSvc,
 		reminderService: reminderSvc,
+		personService:   personSvc,
 	}, nil
 }
 

@@ -7,6 +7,38 @@ import (
 	"github.com/tazhate/familybot/internal/domain"
 )
 
+// People keyboard
+func peopleKeyboard(persons []*domain.Person) tgbotapi.InlineKeyboardMarkup {
+	var rows [][]tgbotapi.InlineKeyboardButton
+
+	// Person buttons (show first 5)
+	for i, p := range persons {
+		if i >= 5 {
+			break
+		}
+		row := tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				fmt.Sprintf("%s %s", p.RoleEmoji(), p.Name),
+				fmt.Sprintf("person:%d", p.ID),
+			),
+			tgbotapi.NewInlineKeyboardButtonData("🗑", fmt.Sprintf("del_person:%d", p.ID)),
+		)
+		rows = append(rows, row)
+	}
+
+	// Action row
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("➕ Добавить", "add_person"),
+		tgbotapi.NewInlineKeyboardButtonData("🎂 ДР", "menu:birthdays"),
+	))
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("📋 Задачи", "menu:list"),
+	))
+
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
 // Priority selection keyboard
 func priorityKeyboard(taskTitle string) tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
@@ -125,6 +157,10 @@ func mainMenuKeyboard() tgbotapi.InlineKeyboardMarkup {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("📋 Задачи", "menu:list"),
 			tgbotapi.NewInlineKeyboardButtonData("📅 Сегодня", "menu:today"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👥 Люди", "menu:people"),
+			tgbotapi.NewInlineKeyboardButtonData("🎂 ДР", "menu:birthdays"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔔 Напоминания", "menu:reminders"),

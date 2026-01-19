@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/tazhate/familybot/internal/domain"
@@ -83,11 +84,29 @@ func (s *Storage) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_tasks_done_at ON tasks(done_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_reminders_user_id ON reminders(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_reminders_next_run ON reminders(next_run)`,
+		// Persons table
+		`CREATE TABLE IF NOT EXISTS persons (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			name TEXT NOT NULL,
+			role TEXT NOT NULL DEFAULT 'contact',
+			birthday DATE,
+			notes TEXT DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (user_id) REFERENCES users(id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_persons_user_id ON persons(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_persons_birthday ON persons(birthday)`,
+		// Add person_id to tasks
+		`ALTER TABLE tasks ADD COLUMN person_id INTEGER REFERENCES persons(id)`,
 	}
 
 	for _, m := range migrations {
 		if _, err := s.db.Exec(m); err != nil {
-			return fmt.Errorf("exec migration: %w", err)
+			// Ignore "duplicate column" errors for ALTER TABLE
+			if !strings.Contains(err.Error(), "duplicate column") {
+				return fmt.Errorf("exec migration: %w", err)
+			}
 		}
 	}
 	return nil
@@ -316,5 +335,137 @@ func (s *Storage) UpdateReminderNextRun(id int64, lastSent, nextRun time.Time) e
 
 func (s *Storage) DeleteReminder(id int64) error {
 	_, err := s.db.Exec(`DELETE FROM reminders WHERE id = ?`, id)
+	return err
+}
+
+// === Persons ===
+
+func (s *Storage) CreatePerson(p *domain.Person) error {
+	res, err := s.db.Exec(
+		`INSERT INTO persons (user_id, name, role, birthday, notes) VALUES (?, ?, ?, ?, ?)`,
+		p.UserID, p.Name, p.Role, p.Birthday, p.Notes,
+	)
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	p.ID = id
+	p.CreatedAt = time.Now()
+	return nil
+}
+
+func (s *Storage) GetPerson(id int64) (*domain.Person, error) {
+	p := &domain.Person{}
+	err := s.db.QueryRow(
+		`SELECT id, user_id, name, role, birthday, notes, created_at FROM persons WHERE id = ?`,
+		id,
+	).Scan(&p.ID, &p.UserID, &p.Name, &p.Role, &p.Birthday, &p.Notes, &p.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return p, err
+}
+
+func (s *Storage) GetPersonByName(userID int64, name string) (*domain.Person, error) {
+	p := &domain.Person{}
+	err := s.db.QueryRow(
+		`SELECT id, user_id, name, role, birthday, notes, created_at FROM persons WHERE user_id = ? AND LOWER(name) = LOWER(?)`,
+		userID, name,
+	).Scan(&p.ID, &p.UserID, &p.Name, &p.Role, &p.Birthday, &p.Notes, &p.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return p, err
+}
+
+func (s *Storage) ListPersonsByUser(userID int64) ([]*domain.Person, error) {
+	rows, err := s.db.Query(
+		`SELECT id, user_id, name, role, birthday, notes, created_at
+		 FROM persons WHERE user_id = ? ORDER BY name ASC`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var persons []*domain.Person
+	for rows.Next() {
+		p := &domain.Person{}
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.Role, &p.Birthday, &p.Notes, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		persons = append(persons, p)
+	}
+	return persons, nil
+}
+
+func (s *Storage) ListPersonsWithBirthday(userID int64) ([]*domain.Person, error) {
+	rows, err := s.db.Query(
+		`SELECT id, user_id, name, role, birthday, notes, created_at
+		 FROM persons WHERE user_id = ? AND birthday IS NOT NULL ORDER BY
+		 strftime('%m-%d', birthday) ASC`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var persons []*domain.Person
+	for rows.Next() {
+		p := &domain.Person{}
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.Role, &p.Birthday, &p.Notes, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		persons = append(persons, p)
+	}
+	return persons, nil
+}
+
+func (s *Storage) ListUpcomingBirthdays(userID int64, days int) ([]*domain.Person, error) {
+	// Get persons whose birthday is within the next N days
+	rows, err := s.db.Query(
+		`SELECT id, user_id, name, role, birthday, notes, created_at
+		 FROM persons
+		 WHERE user_id = ? AND birthday IS NOT NULL
+		 ORDER BY
+		   CASE
+		     WHEN strftime('%m-%d', birthday) >= strftime('%m-%d', 'now')
+		     THEN strftime('%m-%d', birthday)
+		     ELSE strftime('%m-%d', birthday, '+1 year')
+		   END ASC`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var persons []*domain.Person
+	for rows.Next() {
+		p := &domain.Person{}
+		if err := rows.Scan(&p.ID, &p.UserID, &p.Name, &p.Role, &p.Birthday, &p.Notes, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		// Filter by days until birthday
+		daysUntil := p.DaysUntilBirthday()
+		if daysUntil >= 0 && daysUntil <= days {
+			persons = append(persons, p)
+		}
+	}
+	return persons, nil
+}
+
+func (s *Storage) UpdatePerson(p *domain.Person) error {
+	_, err := s.db.Exec(
+		`UPDATE persons SET name = ?, role = ?, birthday = ?, notes = ? WHERE id = ?`,
+		p.Name, p.Role, p.Birthday, p.Notes, p.ID,
+	)
+	return err
+}
+
+func (s *Storage) DeletePerson(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM persons WHERE id = ?`, id)
 	return err
 }

@@ -34,9 +34,10 @@ func main() {
 	// Инициализация сервисов
 	taskSvc := service.NewTaskService(store)
 	reminderSvc := service.NewReminderService(store, cfg.Timezone)
+	personSvc := service.NewPersonService(store)
 
 	// Инициализация бота
-	tgBot, err := bot.New(cfg, store, taskSvc, reminderSvc)
+	tgBot, err := bot.New(cfg, store, taskSvc, reminderSvc, personSvc)
 	if err != nil {
 		log.Fatalf("Failed to init bot: %v", err)
 	}

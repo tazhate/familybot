@@ -201,6 +201,10 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 			b.showToday(chatID, msgID, user.ID)
 		case "reminders":
 			b.showReminders(chatID, msgID, user.ID)
+		case "people":
+			b.showPeople(chatID, msgID, user.ID)
+		case "birthdays":
+			b.showBirthdays(chatID, msgID, user.ID)
 		}
 
 	case "back":
@@ -228,6 +232,96 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 	case "add":
 		b.api.Request(tgbotapi.NewCallback(callback.ID, ""))
 		b.SendMessage(chatID, "Напиши текст задачи:")
+
+	case "add_person":
+		b.api.Request(tgbotapi.NewCallback(callback.ID, ""))
+		text := `<b>Добавить человека:</b>
+
+/addperson Имя роль ДД.ММ.ГГГГ
+
+<b>Примеры:</b>
+/addperson Тим ребёнок 12.06.2017
+/addperson Ира семья 17.12
+/addperson Федя контакт`
+		b.SendMessage(chatID, text)
+
+	case "del_person":
+		if len(parts) < 2 {
+			return
+		}
+		personID := atoi(parts[1])
+		person, _ := b.personService.Get(personID)
+		if person == nil {
+			b.api.Request(tgbotapi.NewCallback(callback.ID, "Не найден"))
+			return
+		}
+
+		b.api.Request(tgbotapi.NewCallback(callback.ID, ""))
+
+		text := fmt.Sprintf("🗑 Удалить <b>%s</b>?", person.Name)
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("❌ Да, удалить", fmt.Sprintf("confirm_del_person:%d", personID)),
+				tgbotapi.NewInlineKeyboardButtonData("◀️ Отмена", "menu:people"),
+			),
+		)
+		edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+		edit.ParseMode = "HTML"
+		edit.ReplyMarkup = &kb
+		b.api.Send(edit)
+
+	case "confirm_del_person":
+		if len(parts) < 2 {
+			return
+		}
+		personID := atoi(parts[1])
+		if err := b.personService.Delete(personID, user.ID); err != nil {
+			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
+			return
+		}
+		b.api.Request(tgbotapi.NewCallback(callback.ID, "🗑 Удалено!"))
+		b.showPeople(chatID, msgID, user.ID)
+
+	case "person":
+		if len(parts) < 2 {
+			return
+		}
+		personID := atoi(parts[1])
+		person, _ := b.personService.Get(personID)
+		if person == nil {
+			b.api.Request(tgbotapi.NewCallback(callback.ID, "Не найден"))
+			return
+		}
+
+		b.api.Request(tgbotapi.NewCallback(callback.ID, ""))
+
+		text := fmt.Sprintf("%s <b>%s</b>\n\nРоль: %s", person.RoleEmoji(), person.Name, person.RoleName())
+		if person.HasBirthday() {
+			text += fmt.Sprintf("\n🎂 %s", person.Birthday.Format("02.01.2006"))
+			if person.Birthday.Year() > 1 {
+				text += fmt.Sprintf(" (%d лет)", person.Age())
+			}
+			days := person.DaysUntilBirthday()
+			if days == 0 {
+				text += "\n<b>СЕГОДНЯ ДЕНЬ РОЖДЕНИЯ!</b>"
+			} else {
+				text += fmt.Sprintf("\nДо ДР: %d дн.", days)
+			}
+		}
+		if person.Notes != "" {
+			text += fmt.Sprintf("\n\n📝 %s", person.Notes)
+		}
+
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить", fmt.Sprintf("del_person:%d", personID)),
+				tgbotapi.NewInlineKeyboardButtonData("◀️ Назад", "menu:people"),
+			),
+		)
+		edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+		edit.ParseMode = "HTML"
+		edit.ReplyMarkup = &kb
+		b.api.Send(edit)
 
 	default:
 		b.api.Request(tgbotapi.NewCallback(callback.ID, ""))
@@ -287,6 +381,43 @@ func (b *Bot) showReminders(chatID int64, msgID int, userID int64) {
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("◀️ Назад", "menu:list"),
+		),
+	)
+
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	edit.ParseMode = "HTML"
+	edit.ReplyMarkup = &kb
+	b.api.Send(edit)
+}
+
+func (b *Bot) showPeople(chatID int64, msgID int, userID int64) {
+	persons, _ := b.personService.List(userID)
+
+	text := "<b>👥 Люди</b>\n\n"
+	if len(persons) == 0 {
+		text += "Список пуст.\n\nДобавь: /addperson Тим ребёнок 12.06.2017"
+	} else {
+		text += b.personService.FormatPersonList(persons)
+	}
+
+	kb := peopleKeyboard(persons)
+
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	edit.ParseMode = "HTML"
+	edit.ReplyMarkup = &kb
+	b.api.Send(edit)
+}
+
+func (b *Bot) showBirthdays(chatID int64, msgID int, userID int64) {
+	persons, _ := b.personService.ListUpcomingBirthdays(userID, 60)
+
+	text := "<b>🎂 Ближайшие дни рождения</b>\n\n"
+	text += b.personService.FormatBirthdaysList(persons)
+
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👥 Все люди", "menu:people"),
+			tgbotapi.NewInlineKeyboardButtonData("📋 Задачи", "menu:list"),
 		),
 	)
 
