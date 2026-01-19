@@ -1,7 +1,7 @@
 .PHONY: build run test clean docker-build docker-push deploy
 
 APP_NAME := familybot
-REGISTRY := registry.tazhate.com
+REGISTRY := docker.tazhate.com
 IMAGE := $(REGISTRY)/$(APP_NAME)
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 

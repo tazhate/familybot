@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: familybot
-          image: registry.tazhate.com/familybot:latest
+          image: docker.tazhate.com/familybot:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
