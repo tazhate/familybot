@@ -34,6 +34,11 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) {
 		return
 	}
 
+	// Авто-регистрация если пользователь в allowed list но не зарегистрирован
+	if user == nil {
+		user = b.autoRegisterUser(msg.From)
+	}
+
 	text := strings.TrimSpace(msg.Text)
 	if text == "" {
 		return
@@ -51,6 +56,33 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) {
 	}
 }
 
+// autoRegisterUser auto-registers an allowed user
+func (b *Bot) autoRegisterUser(from *tgbotapi.User) *domain.User {
+	name := from.FirstName
+	if from.LastName != "" {
+		name += " " + from.LastName
+	}
+
+	role := domain.RoleOwner
+	if from.ID == b.cfg.PartnerTelegramID {
+		role = domain.RolePartner
+	}
+
+	newUser := &domain.User{
+		TelegramID: from.ID,
+		Name:       name,
+		Role:       role,
+	}
+
+	if err := b.storage.CreateUser(newUser); err != nil {
+		log.Printf("Error auto-registering user: %v", err)
+		return nil
+	}
+
+	log.Printf("Auto-registered user: %s (ID: %d)", name, from.ID)
+	return newUser
+}
+
 func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 	userID := callback.From.ID
 	chatID := callback.Message.Chat.ID
@@ -63,8 +95,11 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 
 	user, _ := b.storage.GetUserByTelegramID(userID)
 	if user == nil {
-		b.api.Request(tgbotapi.NewCallback(callback.ID, "Сначала /start"))
-		return
+		user = b.autoRegisterUser(callback.From)
+		if user == nil {
+			b.api.Request(tgbotapi.NewCallback(callback.ID, "Ошибка регистрации"))
+			return
+		}
 	}
 
 	data := callback.Data
