@@ -35,3 +35,22 @@ config:
   timezone: "Europe/Lisbon"
   morningTime: "09:00"
   eveningTime: "21:00"
+
+# MCP HTTP Server (for mobile Claude)
+mcp:
+  enabled: true
+  image:
+    repository: docker.tazhate.com/familybot-mcp
+    tag: latest
+    pullPolicy: Always
+  service:
+    port: 8081
+  ingress:
+    host: mcp.family.tazhate.com
+  resources:
+    requests:
+      memory: "32Mi"
+      cpu: "25m"
+    limits:
+      memory: "128Mi"
+      cpu: "100m"

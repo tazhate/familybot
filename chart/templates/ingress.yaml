@@ -2,11 +2,11 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ .Release.Name }}
+  name: {{ include "familybot.fullname" . }}
   labels:
-    app: {{ .Release.Name }}
+    {{- include "familybot.labels" . | nindent 4 }}
   annotations:
-    {{- if .Values.ingress.tls }}
+    {{- if .Values.ingress.clusterIssuer }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer }}
     {{- end }}
 spec:
@@ -15,7 +15,7 @@ spec:
   tls:
     - hosts:
         - {{ .Values.ingress.host }}
-      secretName: {{ .Release.Name }}-tls
+      secretName: {{ include "familybot.fullname" . }}-tls
   {{- end }}
   rules:
     - host: {{ .Values.ingress.host }}
@@ -25,7 +25,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: {{ .Release.Name }}
+                name: {{ include "familybot.fullname" . }}
                 port:
                   number: {{ .Values.service.port }}
 {{- end }}

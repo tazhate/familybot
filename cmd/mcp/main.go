@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -93,6 +94,7 @@ type MCPServer struct {
 	apiURL      string
 	apiUsername string
 	apiPassword string
+	mcpToken    string
 }
 
 func NewMCPServer() *MCPServer {
@@ -104,10 +106,12 @@ func NewMCPServer() *MCPServer {
 		apiURL:      apiURL,
 		apiUsername: os.Getenv("FAMILYBOT_API_USERNAME"),
 		apiPassword: os.Getenv("FAMILYBOT_API_PASSWORD"),
+		mcpToken:    os.Getenv("FAMILYBOT_MCP_TOKEN"),
 	}
 }
 
-func (s *MCPServer) Run() {
+// RunStdio runs the server in stdio mode (for local Claude Code)
+func (s *MCPServer) RunStdio() {
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
@@ -135,6 +139,147 @@ func (s *MCPServer) Run() {
 		responseBytes, _ := json.Marshal(response)
 		fmt.Println(string(responseBytes))
 	}
+}
+
+// RunHTTP runs the server in HTTP mode (for mobile Claude)
+func (s *MCPServer) RunHTTP(addr string) {
+	http.HandleFunc("/mcp", s.handleHTTP)
+	http.HandleFunc("/mcp/sse", s.handleSSE)
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
+	log.Printf("MCP HTTP server starting on %s", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Fatalf("HTTP server error: %v", err)
+	}
+}
+
+// handleHTTP handles regular HTTP POST requests
+func (s *MCPServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	// CORS headers for browser clients
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Check authentication
+	if !s.checkAuth(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Read request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Error reading body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	var req JSONRPCRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	response := s.handleRequest(req)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleSSE handles Server-Sent Events for streaming (MCP Streamable HTTP)
+func (s *MCPServer) handleSSE(w http.ResponseWriter, r *http.Request) {
+	// CORS headers
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Check authentication
+	if !s.checkAuth(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Set SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// For GET requests, just keep connection alive (for initial SSE setup)
+	if r.Method == "GET" {
+		// Send endpoint event to tell client where to POST
+		fmt.Fprintf(w, "event: endpoint\ndata: /mcp\n\n")
+		flusher.Flush()
+
+		// Keep connection alive
+		<-r.Context().Done()
+		return
+	}
+
+	// For POST requests, process the JSON-RPC request
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		fmt.Fprintf(w, "event: error\ndata: Error reading body\n\n")
+		flusher.Flush()
+		return
+	}
+	defer r.Body.Close()
+
+	var req JSONRPCRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		fmt.Fprintf(w, "event: error\ndata: Invalid JSON\n\n")
+		flusher.Flush()
+		return
+	}
+
+	response := s.handleRequest(req)
+	responseBytes, _ := json.Marshal(response)
+
+	fmt.Fprintf(w, "event: message\ndata: %s\n\n", string(responseBytes))
+	flusher.Flush()
+}
+
+// checkAuth verifies Bearer token or Basic auth
+func (s *MCPServer) checkAuth(r *http.Request) bool {
+	if s.mcpToken == "" {
+		return true // No auth required if token not configured
+	}
+
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		return false
+	}
+
+	// Check Bearer token
+	if strings.HasPrefix(auth, "Bearer ") {
+		token := strings.TrimPrefix(auth, "Bearer ")
+		return token == s.mcpToken
+	}
+
+	return false
 }
 
 func (s *MCPServer) handleRequest(req JSONRPCRequest) JSONRPCResponse {
@@ -366,5 +511,12 @@ func (s *MCPServer) apiRequest(method, path string, body interface{}) (string, b
 
 func main() {
 	server := NewMCPServer()
-	server.Run()
+
+	// Check if running in HTTP mode
+	httpAddr := os.Getenv("MCP_HTTP_ADDR")
+	if httpAddr != "" {
+		server.RunHTTP(httpAddr)
+	} else {
+		server.RunStdio()
+	}
 }

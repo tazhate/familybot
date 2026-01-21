@@ -1,0 +1,35 @@
+{{- if and .Values.mcp.enabled .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "familybot.fullname" . }}-mcp
+  labels:
+    {{- include "familybot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mcp
+  annotations:
+    {{- if .Values.ingress.clusterIssuer }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer }}
+    {{- end }}
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  {{- if .Values.ingress.tls }}
+  tls:
+    - hosts:
+        - {{ .Values.mcp.ingress.host }}
+      secretName: {{ include "familybot.fullname" . }}-mcp-tls
+  {{- end }}
+  rules:
+    - host: {{ .Values.mcp.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "familybot.fullname" . }}-mcp
+                port:
+                  number: {{ .Values.mcp.service.port }}
+{{- end }}

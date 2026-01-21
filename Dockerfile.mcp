@@ -1,0 +1,20 @@
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build -a -ldflags '-extldflags "-static"' -o /familybot-mcp ./cmd/mcp
+
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata
+
+COPY --from=builder /familybot-mcp /familybot-mcp
+
+EXPOSE 8081
+
+CMD ["/familybot-mcp"]

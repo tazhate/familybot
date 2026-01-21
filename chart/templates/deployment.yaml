@@ -1,33 +1,57 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .Release.Name }}
+  name: {{ include "familybot.fullname" . }}
   labels:
-    app: {{ .Release.Name }}
+    {{- include "familybot.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app: {{ .Release.Name }}
+      {{- include "familybot.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        app: {{ .Release.Name }}
+        {{- include "familybot.selectorLabels" . | nindent 8 }}
     spec:
       containers:
-        - name: {{ .Release.Name }}
+        - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - containerPort: {{ .Values.service.port }}
               name: http
+          env:
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: telegram-bot-token
+            - name: OWNER_TELEGRAM_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: owner-telegram-id
+            - name: PARTNER_TELEGRAM_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: partner-telegram-id
+            - name: API_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: api-username
+            - name: API_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: api-password
           envFrom:
-            - secretRef:
-                name: {{ .Release.Name }}-secrets
             - configMapRef:
-                name: {{ .Release.Name }}-config
+                name: {{ include "familybot.fullname" . }}
           volumeMounts:
             - name: data
               mountPath: /data
@@ -48,4 +72,4 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: {{ .Release.Name }}-data
+            claimName: {{ include "familybot.fullname" . }}-data

@@ -1,0 +1,63 @@
+{{- if .Values.mcp.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "familybot.fullname" . }}-mcp
+  labels:
+    {{- include "familybot.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "familybot.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: mcp
+  template:
+    metadata:
+      labels:
+        {{- include "familybot.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: mcp
+    spec:
+      containers:
+        - name: mcp
+          image: "{{ .Values.mcp.image.repository }}:{{ .Values.mcp.image.tag }}"
+          imagePullPolicy: {{ .Values.mcp.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8081
+              protocol: TCP
+          env:
+            - name: MCP_HTTP_ADDR
+              value: ":8081"
+            - name: FAMILYBOT_API_URL
+              value: "http://{{ include "familybot.fullname" . }}:{{ .Values.service.port }}"
+            - name: FAMILYBOT_API_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: api-username
+            - name: FAMILYBOT_API_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: api-password
+            - name: FAMILYBOT_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: mcp-token
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.mcp.resources | nindent 12 }}
+{{- end }}
