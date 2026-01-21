@@ -8,15 +8,17 @@ import (
 )
 
 type Config struct {
-	TelegramToken    string
-	OwnerTelegramID  int64
+	TelegramToken     string
+	OwnerTelegramID   int64
 	PartnerTelegramID int64
-	DatabasePath     string
-	Timezone         *time.Location
-	MorningTime      string
-	EveningTime      string
-	WebhookURL       string
-	ServerPort       string
+	DatabasePath      string
+	Timezone          *time.Location
+	MorningTime       string
+	EveningTime       string
+	WebhookURL        string
+	ServerPort        string
+	APIUsername       string
+	APIPassword       string
 }
 
 func Load() (*Config, error) {
@@ -69,16 +71,21 @@ func Load() (*Config, error) {
 		serverPort = "8080"
 	}
 
+	apiUsername := os.Getenv("API_USERNAME")
+	apiPassword := os.Getenv("API_PASSWORD")
+
 	return &Config{
-		TelegramToken:    token,
-		OwnerTelegramID:  ownerID,
+		TelegramToken:     token,
+		OwnerTelegramID:   ownerID,
 		PartnerTelegramID: partnerID,
-		DatabasePath:     dbPath,
-		Timezone:         tz,
-		MorningTime:      morningTime,
-		EveningTime:      eveningTime,
-		WebhookURL:       webhookURL,
-		ServerPort:       serverPort,
+		DatabasePath:      dbPath,
+		Timezone:          tz,
+		MorningTime:       morningTime,
+		EveningTime:       eveningTime,
+		WebhookURL:        webhookURL,
+		ServerPort:        serverPort,
+		APIUsername:       apiUsername,
+		APIPassword:       apiPassword,
 	}, nil
 }
 

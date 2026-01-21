@@ -1,0 +1,37 @@
+replicaCount: 1
+
+image:
+  repository: docker.tazhate.com/familybot
+  tag: latest
+  pullPolicy: Always
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: true
+  host: family.tazhate.com
+  tls: true
+  clusterIssuer: letsencrypt-prod
+
+resources:
+  requests:
+    memory: "64Mi"
+    cpu: "50m"
+  limits:
+    memory: "256Mi"
+    cpu: "200m"
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""
+
+config:
+  webhookURL: "https://family.tazhate.com"
+  serverPort: "8080"
+  dbPath: "/data/familybot.db"
+  timezone: "Europe/Lisbon"
+  morningTime: "09:00"
+  eveningTime: "21:00"

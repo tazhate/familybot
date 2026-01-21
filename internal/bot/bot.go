@@ -13,16 +13,19 @@ import (
 )
 
 type Bot struct {
-	api             *tgbotapi.BotAPI
-	cfg             *config.Config
-	storage         *storage.Storage
-	taskService     *service.TaskService
-	reminderService *service.ReminderService
-	personService   *service.PersonService
-	server          *http.Server
+	api              *tgbotapi.BotAPI
+	cfg              *config.Config
+	storage          *storage.Storage
+	taskService      *service.TaskService
+	reminderService  *service.ReminderService
+	personService    *service.PersonService
+	scheduleService  *service.ScheduleService
+	autoService      *service.AutoService
+	checklistService *service.ChecklistService
+	server           *http.Server
 }
 
-func New(cfg *config.Config, storage *storage.Storage, taskSvc *service.TaskService, reminderSvc *service.ReminderService, personSvc *service.PersonService) (*Bot, error) {
+func New(cfg *config.Config, storage *storage.Storage, taskSvc *service.TaskService, reminderSvc *service.ReminderService, personSvc *service.PersonService, scheduleSvc *service.ScheduleService, autoSvc *service.AutoService, checklistSvc *service.ChecklistService) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
 	if err != nil {
 		return nil, fmt.Errorf("create bot api: %w", err)
@@ -30,14 +33,38 @@ func New(cfg *config.Config, storage *storage.Storage, taskSvc *service.TaskServ
 
 	log.Printf("Authorized as @%s", api.Self.UserName)
 
-	return &Bot{
-		api:             api,
-		cfg:             cfg,
-		storage:         storage,
-		taskService:     taskSvc,
-		reminderService: reminderSvc,
-		personService:   personSvc,
-	}, nil
+	bot := &Bot{
+		api:              api,
+		cfg:              cfg,
+		storage:          storage,
+		taskService:      taskSvc,
+		reminderService:  reminderSvc,
+		personService:    personSvc,
+		scheduleService:  scheduleSvc,
+		autoService:      autoSvc,
+		checklistService: checklistSvc,
+	}
+
+	// Set bot commands (menu button)
+	bot.setCommands()
+
+	return bot, nil
+}
+
+func (b *Bot) setCommands() {
+	commands := []tgbotapi.BotCommand{
+		{Command: "menu", Description: "📱 Главное меню"},
+		{Command: "list", Description: "📋 Список задач"},
+		{Command: "add", Description: "➕ Добавить задачу"},
+		{Command: "today", Description: "📅 Задачи на сегодня"},
+		{Command: "week", Description: "🗓 Недельное расписание"},
+		{Command: "help", Description: "❓ Справка по командам"},
+	}
+
+	cfg := tgbotapi.NewSetMyCommands(commands...)
+	if _, err := b.api.Request(cfg); err != nil {
+		log.Printf("Failed to set commands: %v", err)
+	}
 }
 
 func (b *Bot) SetupWebhook() error {
@@ -74,6 +101,9 @@ func (b *Bot) Start(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
+
+	// Setup REST API with Basic Auth
+	b.SetupAPI()
 
 	b.server = &http.Server{
 		Addr:    ":" + b.cfg.ServerPort,
@@ -117,6 +147,20 @@ func (b *Bot) SendMessageWithKeyboard(chatID int64, text string, keyboard tgbota
 	msg.ReplyMarkup = keyboard
 	_, err := b.api.Send(msg)
 	return err
+}
+
+// SendMessageWithSnooze sends a reminder message with snooze buttons
+func (b *Bot) SendMessageWithSnooze(chatID int64, text string, taskID int64) error {
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ Выполнено", fmt.Sprintf("done:%d", taskID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⏰ +1 час", fmt.Sprintf("snooze:%d:1h", taskID)),
+			tgbotapi.NewInlineKeyboardButtonData("🌅 Завтра", fmt.Sprintf("snooze:%d:tomorrow", taskID)),
+		),
+	)
+	return b.SendMessageWithKeyboard(chatID, text, kb)
 }
 
 func (b *Bot) API() *tgbotapi.BotAPI {

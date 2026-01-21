@@ -57,6 +57,10 @@ func taskKeyboard(taskID int64) tgbotapi.InlineKeyboardMarkup {
 			tgbotapi.NewInlineKeyboardButtonData("✅ Выполнено", fmt.Sprintf("done:%d", taskID)),
 			tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить", fmt.Sprintf("del:%d", taskID)),
 		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👨‍👩‍👧 Сделать общей", fmt.Sprintf("share:%d", taskID)),
+			tgbotapi.NewInlineKeyboardButtonData("📋 К списку", "menu:list"),
+		),
 	)
 }
 
@@ -159,14 +163,89 @@ func mainMenuKeyboard() tgbotapi.InlineKeyboardMarkup {
 			tgbotapi.NewInlineKeyboardButtonData("📅 Сегодня", "menu:today"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("👥 Люди", "menu:people"),
+			tgbotapi.NewInlineKeyboardButtonData("🗓 Расписание", "menu:week"),
 			tgbotapi.NewInlineKeyboardButtonData("🎂 ДР", "menu:birthdays"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("👥 Люди", "menu:people"),
+			tgbotapi.NewInlineKeyboardButtonData("🚗 Машины", "menu:autos"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🔔 Напоминания", "menu:reminders"),
 			tgbotapi.NewInlineKeyboardButtonData("➕ Добавить", "add"),
 		),
 	)
+}
+
+// Week schedule keyboard
+func weekScheduleKeyboard() tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("➕ Добавить", "add_weekly"),
+			tgbotapi.NewInlineKeyboardButtonData("🔄 Плавающие", "menu:floating"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📋 Задачи", "menu:list"),
+			tgbotapi.NewInlineKeyboardButtonData("🏠 Меню", "menu:main"),
+		),
+	)
+}
+
+// Floating event keyboard - for selecting day
+func floatingEventKeyboard(event *domain.WeeklyEvent) tgbotapi.InlineKeyboardMarkup {
+	days := event.GetFloatingDays()
+	var buttons []tgbotapi.InlineKeyboardButton
+
+	for _, d := range days {
+		buttons = append(buttons, tgbotapi.NewInlineKeyboardButtonData(
+			domain.WeekdayNameShort(d),
+			fmt.Sprintf("confirm_float:%d:%d", event.ID, d),
+		))
+	}
+
+	return tgbotapi.NewInlineKeyboardMarkup(
+		buttons,
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📅 Расписание", "menu:week"),
+		),
+	)
+}
+
+// Floating list keyboard
+func floatingListKeyboard(events []*domain.WeeklyEvent) tgbotapi.InlineKeyboardMarkup {
+	var rows [][]tgbotapi.InlineKeyboardButton
+
+	// Show each event with day selection buttons
+	for _, e := range events {
+		if !e.IsConfirmedThisWeek() {
+			days := e.GetFloatingDays()
+			var dayButtons []tgbotapi.InlineKeyboardButton
+
+			// Event title button
+			titleBtn := tgbotapi.NewInlineKeyboardButtonData(
+				fmt.Sprintf("🔄 %s:", truncate(e.Title, 15)),
+				fmt.Sprintf("floating:%d", e.ID),
+			)
+			dayButtons = append(dayButtons, titleBtn)
+
+			// Day buttons
+			for _, d := range days {
+				dayButtons = append(dayButtons, tgbotapi.NewInlineKeyboardButtonData(
+					domain.WeekdayNameShort(d),
+					fmt.Sprintf("confirm_float:%d:%d", e.ID, d),
+				))
+			}
+			rows = append(rows, dayButtons)
+		}
+	}
+
+	// Add navigation buttons
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("➕ Добавить", "add_floating"),
+		tgbotapi.NewInlineKeyboardButtonData("📅 Расписание", "menu:week"),
+	))
+
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
 }
 
 // Today keyboard
@@ -179,8 +258,8 @@ func todayKeyboard(tasks []*domain.Task) *tgbotapi.InlineKeyboardMarkup {
 		}
 		row := tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData(
-				fmt.Sprintf("✅ %s", truncate(t.Title, 30)),
-				fmt.Sprintf("done:%d", t.ID),
+				fmt.Sprintf("⬜ %s", truncate(t.Title, 30)),
+				fmt.Sprintf("done_today:%d", t.ID),
 			),
 		)
 		rows = append(rows, row)
@@ -196,4 +275,80 @@ func todayKeyboard(tasks []*domain.Task) *tgbotapi.InlineKeyboardMarkup {
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
 	return &keyboard
+}
+
+// Checklist keyboard - shows items as checkable buttons
+func checklistKeyboard(c *domain.Checklist) tgbotapi.InlineKeyboardMarkup {
+	var rows [][]tgbotapi.InlineKeyboardButton
+
+	for i, item := range c.Items {
+		status := "⬜"
+		if item.Checked {
+			status = "✅"
+		}
+		row := tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				fmt.Sprintf("%s %s", status, truncate(item.Text, 30)),
+				fmt.Sprintf("cl_check:%d:%d", c.ID, i),
+			),
+		)
+		rows = append(rows, row)
+	}
+
+	// Action row
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("🔄 Сбросить", fmt.Sprintf("cl_reset:%d", c.ID)),
+		tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить", fmt.Sprintf("cl_del:%d", c.ID)),
+	))
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("📋 Все чек-листы", "menu:checklists"),
+	))
+
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
+
+// Edit task keyboard
+func editTaskKeyboard(taskID int64) tgbotapi.InlineKeyboardMarkup {
+	return tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔴 Срочно", fmt.Sprintf("pri:%d:urgent", taskID)),
+			tgbotapi.NewInlineKeyboardButtonData("🟡 Неделя", fmt.Sprintf("pri:%d:week", taskID)),
+			tgbotapi.NewInlineKeyboardButtonData("🟢 Потом", fmt.Sprintf("pri:%d:someday", taskID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📅 Завтра", fmt.Sprintf("date:%d:tomorrow", taskID)),
+			tgbotapi.NewInlineKeyboardButtonData("📅 +Неделя", fmt.Sprintf("date:%d:week", taskID)),
+			tgbotapi.NewInlineKeyboardButtonData("📅 Убрать", fmt.Sprintf("date:%d:clear", taskID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("✅ Выполнено", fmt.Sprintf("done:%d", taskID)),
+			tgbotapi.NewInlineKeyboardButtonData("🗑 Удалить", fmt.Sprintf("del:%d", taskID)),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📋 К списку", "menu:list"),
+		),
+	)
+}
+
+// Checklists list keyboard
+func checklistsListKeyboard(checklists []*domain.Checklist) tgbotapi.InlineKeyboardMarkup {
+	var rows [][]tgbotapi.InlineKeyboardButton
+
+	for _, c := range checklists {
+		row := tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				fmt.Sprintf("📋 %s (%d/%d)", c.Title, c.CheckedCount(), len(c.Items)),
+				fmt.Sprintf("cl_view:%d", c.ID),
+			),
+		)
+		rows = append(rows, row)
+	}
+
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("➕ Создать", "add_checklist"),
+		tgbotapi.NewInlineKeyboardButtonData("🏠 Меню", "menu:main"),
+	))
+
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
 }

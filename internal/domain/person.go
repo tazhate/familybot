@@ -14,13 +14,19 @@ const (
 
 // Person represents a person in the family circle
 type Person struct {
-	ID        int64
-	UserID    int64      // Owner user
-	Name      string     // Display name
-	Role      PersonRole // child, family, contact, partner_child
-	Birthday  *time.Time // nil if unknown
-	Notes     string     // Additional info
-	CreatedAt time.Time
+	ID         int64
+	UserID     int64      // Owner user
+	TelegramID *int64     // Linked Telegram user ID (nil if not in Telegram)
+	Name       string     // Display name
+	Role       PersonRole // child, family, contact, partner_child
+	Birthday   *time.Time // nil if unknown
+	Notes      string     // Additional info
+	CreatedAt  time.Time
+}
+
+// HasTelegram returns true if person is linked to Telegram
+func (p *Person) HasTelegram() bool {
+	return p.TelegramID != nil
 }
 
 // Age returns current age if birthday is set

@@ -61,7 +61,7 @@ func (s *ReminderService) Create(userID int64, title string, reminderType domain
 func (s *ReminderService) buildCronSchedule(reminderType domain.ReminderType, params domain.ReminderParams) (string, error) {
 	timeStr := params.Time
 	if timeStr == "" {
-		timeStr = "09:00"
+		timeStr = "11:00"
 	}
 	parts := strings.Split(timeStr, ":")
 	if len(parts) != 2 {
@@ -116,6 +116,10 @@ func (s *ReminderService) List(userID int64) ([]*domain.Reminder, error) {
 	return s.storage.ListRemindersByUser(userID)
 }
 
+func (s *ReminderService) Get(reminderID int64) (*domain.Reminder, error) {
+	return s.storage.GetReminder(reminderID)
+}
+
 func (s *ReminderService) GetDueReminders() ([]*domain.Reminder, error) {
 	now := time.Now().In(s.timezone)
 	return s.storage.ListDueReminders(now)
@@ -168,7 +172,7 @@ func (s *ReminderService) FormatReminderList(reminders []*domain.Reminder) strin
 		}
 		nextStr := "—"
 		if r.NextRun != nil {
-			nextStr = r.NextRun.In(s.timezone).Format("02.01 15:04")
+			nextStr = r.NextRun.In(s.timezone).Format("02.01.06 15:04")
 		}
 		sb.WriteString(fmt.Sprintf("%s #%d %s (след: %s)\n", status, r.ID, r.Title, nextStr))
 	}

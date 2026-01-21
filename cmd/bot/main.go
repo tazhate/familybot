@@ -35,9 +35,13 @@ func main() {
 	taskSvc := service.NewTaskService(store)
 	reminderSvc := service.NewReminderService(store, cfg.Timezone)
 	personSvc := service.NewPersonService(store)
+	personSvc.SetReminderService(reminderSvc) // для автосоздания напоминаний о ДР
+	scheduleSvc := service.NewScheduleService(store)
+	autoSvc := service.NewAutoService(store)
+	checklistSvc := service.NewChecklistService(store)
 
 	// Инициализация бота
-	tgBot, err := bot.New(cfg, store, taskSvc, reminderSvc, personSvc)
+	tgBot, err := bot.New(cfg, store, taskSvc, reminderSvc, personSvc, scheduleSvc, autoSvc, checklistSvc)
 	if err != nil {
 		log.Fatalf("Failed to init bot: %v", err)
 	}
@@ -48,7 +52,7 @@ func main() {
 	}
 
 	// Инициализация scheduler
-	sched := scheduler.New(cfg, store, taskSvc, reminderSvc)
+	sched := scheduler.New(cfg, store, taskSvc, reminderSvc, personSvc, scheduleSvc)
 	sched.SetSender(tgBot)
 
 	// Контекст для graceful shutdown

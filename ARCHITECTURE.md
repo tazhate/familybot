@@ -67,10 +67,12 @@ familybot/
 │   │   └── scheduler.go
 │   └── service/
 │       ├── task_service.go
-│       └── reminder_service.go
+│       ├── reminder_service.go
+│       ├── schedule_service.go
+│       └── person_service.go
 ├── config/
 │   └── config.go
-├── k8s/
+├── k8s/                      # (legacy, используется Helm)
 │   ├── namespace.yaml
 │   ├── secret.yaml
 │   ├── configmap.yaml
@@ -78,6 +80,17 @@ familybot/
 │   ├── deployment.yaml
 │   ├── service.yaml
 │   └── ingress.yaml
+├── chart/                    # Helm chart (актуальный деплой)
+│   ├── Chart.yaml
+│   ├── values.yaml
+│   ├── secrets.yaml          # (gitignored)
+│   └── templates/
+│       ├── deployment.yaml
+│       ├── service.yaml
+│       ├── ingress.yaml
+│       ├── configmap.yaml
+│       ├── pvc.yaml
+│       └── secret.yaml
 ├── .github/
 │   └── workflows/
 │       └── deploy.yaml
@@ -133,10 +146,27 @@ type Person struct {
     ID        int64
     UserID    int64
     Name      string
-    Role      string     // "child", "family", "contact"
+    Role      string     // "child", "family", "contact", "partner_child"
     Birthday  *time.Time
     Notes     string
     CreatedAt time.Time
+}
+
+// WeeklyEvent — еженедельное событие
+type WeeklyEvent struct {
+    ID             int64
+    UserID         int64
+    DayOfWeek      int        // 0=Вс, 1=Пн, ..., 6=Сб
+    TimeStart      string     // "16:00"
+    TimeEnd        string     // "20:00" (опционально)
+    Title          string
+    PersonID       *int64     // связь с Person
+    ReminderBefore int        // минут до события
+    IsFloating     bool       // плавающее событие
+    FloatingDays   string     // "5,6" (Пт,Сб)
+    ConfirmedDay   *int       // подтверждённый день
+    ConfirmedWeek  *int       // номер недели подтверждения
+    CreatedAt      time.Time
 }
 ```
 
@@ -147,10 +177,17 @@ type Person struct {
 /add <текст>        — добавить задачу
 /list               — список задач
 /done <id>          — выполнить задачу
+/del <id>           — удалить задачу
 /remind <текст>     — добавить напоминание
 /reminders          — список напоминаний
 /today              — что на сегодня
 /week               — расписание недели
+/addweekly          — добавить еженедельное событие
+/delweekly          — удалить еженедельное событие
+/addfloating        — добавить плавающее событие
+/floating           — список плавающих событий
+/people             — список людей
+/addperson          — добавить человека
 /birthdays          — ближайшие дни рождения
 /shared             — общие семейные задачи
 /assign <id> <user> — назначить задачу
@@ -166,35 +203,35 @@ type Person struct {
 
 ## План реализации
 
-### Фаза 1: MVP (базовый функционал)
-- [ ] Инициализация проекта (go mod, структура)
-- [ ] Подключение к Telegram Bot API
-- [ ] SQLite + базовые миграции
-- [ ] Регистрация пользователя (/start)
-- [ ] CRUD задач (/add, /list, /done)
-- [ ] Базовый scheduler для напоминаний
+### Фаза 1: MVP (базовый функционал) ✅
+- [x] Инициализация проекта (go mod, структура)
+- [x] Подключение к Telegram Bot API
+- [x] SQLite + базовые миграции
+- [x] Регистрация пользователя (/start)
+- [x] CRUD задач (/add, /list, /done, /del)
+- [x] Базовый scheduler для напоминаний
 
-### Фаза 2: Расписание
-- [ ] Еженедельное расписание (/week)
-- [ ] Ежедневные напоминания (утро/вечер)
-- [ ] Еженедельные напоминания (день недели)
+### Фаза 2: Расписание ✅
+- [x] Еженедельное расписание (/week)
+- [x] Ежедневные напоминания (утро/вечер)
+- [x] Еженедельные напоминания (день недели)
 - [ ] Ежемесячные (4-е число)
 - [ ] По неделе месяца (2-я пятница)
 
-### Фаза 3: Многопользовательность
-- [ ] Добавление партнёра (Ира)
+### Фаза 3: Многопользовательность (частично)
+- [x] Добавление партнёра (Ира) — конфиг PARTNER_TELEGRAM_ID
 - [ ] Общие семейные задачи
 - [ ] Назначение задач друг другу
 - [ ] Раздельные/общие напоминания
 
-### Фаза 4: Расширенные функции
-- [ ] Люди (дети, родственники) с ДР
-- [ ] Напоминания о днях рождения
+### Фаза 4: Расширенные функции (частично)
+- [x] Люди (дети, родственники) с ДР — /people, /addperson
+- [x] Напоминания о днях рождения — /birthdays
 - [ ] Авто (ТО, страховки)
 - [ ] Интеграция с Google Calendar (опционально)
 
-### Фаза 5: UX улучшения
-- [ ] Inline-кнопки везде
+### Фаза 5: UX улучшения (частично)
+- [x] Inline-кнопки везде
 - [ ] Быстрый ввод голосом (speech-to-text)
 - [ ] Группировка по контексту
 - [ ] Статистика выполнения
@@ -316,7 +353,7 @@ spec:
     spec:
       containers:
       - name: familybot
-        image: registry.tazhate.com/familybot:latest
+        image: docker.tazhate.com/familybot:latest
         envFrom:
         - secretRef:
             name: familybot-secrets
@@ -419,12 +456,12 @@ jobs:
 
     - name: Build & Push
       run: |
-        docker build -t registry.tazhate.com/familybot:${{ github.sha }} .
-        docker push registry.tazhate.com/familybot:${{ github.sha }}
+        docker build -t docker.tazhate.com/familybot:${{ github.sha }} .
+        docker push docker.tazhate.com/familybot:${{ github.sha }}
 
     - name: Deploy to K8s
       run: |
         kubectl set image deploy/familybot \
-          familybot=registry.tazhate.com/familybot:${{ github.sha }} \
+          familybot=docker.tazhate.com/familybot:${{ github.sha }} \
           -n familybot
 ```
