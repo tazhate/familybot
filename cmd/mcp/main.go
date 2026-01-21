@@ -3,13 +3,20 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
 
 // JSON-RPC structures
@@ -89,12 +96,34 @@ type ContentBlock struct {
 	Text string `json:"text"`
 }
 
+// OAuth structures
+type AuthCode struct {
+	Code          string
+	ClientID      string
+	RedirectURI   string
+	CodeChallenge string
+	Scope         string
+	ExpiresAt     time.Time
+}
+
+type AccessToken struct {
+	Token     string
+	ClientID  string
+	Scope     string
+	ExpiresAt time.Time
+}
+
 // MCP Server
 type MCPServer struct {
-	apiURL      string
-	apiUsername string
-	apiPassword string
-	mcpToken    string
+	apiURL       string
+	apiUsername  string
+	apiPassword  string
+	mcpToken     string // Legacy simple token (also used as client_secret)
+	clientID     string // OAuth client ID
+	baseURL      string // Server's base URL for OAuth
+	authCodes    map[string]*AuthCode
+	accessTokens map[string]*AccessToken
+	mu           sync.RWMutex
 }
 
 func NewMCPServer() *MCPServer {
@@ -102,11 +131,26 @@ func NewMCPServer() *MCPServer {
 	if apiURL == "" {
 		apiURL = "https://family.tazhate.com"
 	}
+
+	baseURL := os.Getenv("MCP_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://mcp.family.tazhate.com"
+	}
+
+	clientID := os.Getenv("MCP_CLIENT_ID")
+	if clientID == "" {
+		clientID = "familybot"
+	}
+
 	return &MCPServer{
-		apiURL:      apiURL,
-		apiUsername: os.Getenv("FAMILYBOT_API_USERNAME"),
-		apiPassword: os.Getenv("FAMILYBOT_API_PASSWORD"),
-		mcpToken:    os.Getenv("FAMILYBOT_MCP_TOKEN"),
+		apiURL:       apiURL,
+		apiUsername:  os.Getenv("FAMILYBOT_API_USERNAME"),
+		apiPassword:  os.Getenv("FAMILYBOT_API_PASSWORD"),
+		mcpToken:     os.Getenv("FAMILYBOT_MCP_TOKEN"),
+		clientID:     clientID,
+		baseURL:      baseURL,
+		authCodes:    make(map[string]*AuthCode),
+		accessTokens: make(map[string]*AccessToken),
 	}
 }
 
@@ -143,17 +187,322 @@ func (s *MCPServer) RunStdio() {
 
 // RunHTTP runs the server in HTTP mode (for mobile Claude)
 func (s *MCPServer) RunHTTP(addr string) {
+	// OAuth 2.1 endpoints
+	http.HandleFunc("/.well-known/oauth-protected-resource", s.handleProtectedResourceMetadata)
+	http.HandleFunc("/.well-known/oauth-authorization-server", s.handleAuthServerMetadata)
+	http.HandleFunc("/authorize", s.handleAuthorize)
+	http.HandleFunc("/token", s.handleToken)
+
+	// MCP endpoints
 	http.HandleFunc("/mcp", s.handleHTTP)
 	http.HandleFunc("/mcp/sse", s.handleSSE)
+
+	// Health check
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 	})
 
 	log.Printf("MCP HTTP server starting on %s", addr)
+	log.Printf("OAuth endpoints enabled, base URL: %s", s.baseURL)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("HTTP server error: %v", err)
 	}
+}
+
+// OAuth 2.1 Protected Resource Metadata (RFC 9728)
+func (s *MCPServer) handleProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	metadata := map[string]interface{}{
+		"resource":              s.baseURL,
+		"authorization_servers": []string{s.baseURL},
+		"scopes_supported":      []string{"mcp"},
+	}
+
+	json.NewEncoder(w).Encode(metadata)
+}
+
+// OAuth 2.1 Authorization Server Metadata (RFC 8414)
+func (s *MCPServer) handleAuthServerMetadata(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	metadata := map[string]interface{}{
+		"issuer":                                s.baseURL,
+		"authorization_endpoint":                s.baseURL + "/authorize",
+		"token_endpoint":                        s.baseURL + "/token",
+		"response_types_supported":              []string{"code"},
+		"grant_types_supported":                 []string{"authorization_code"},
+		"code_challenge_methods_supported":      []string{"S256"},
+		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
+		"scopes_supported":                      []string{"mcp"},
+	}
+
+	json.NewEncoder(w).Encode(metadata)
+}
+
+// OAuth 2.1 Authorization Endpoint
+func (s *MCPServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
+	log.Printf("OAuth /authorize request: %s %s", r.Method, r.URL.String())
+
+	// CORS
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Parse parameters
+	clientID := r.URL.Query().Get("client_id")
+	redirectURI := r.URL.Query().Get("redirect_uri")
+	responseType := r.URL.Query().Get("response_type")
+	scope := r.URL.Query().Get("scope")
+	state := r.URL.Query().Get("state")
+	codeChallenge := r.URL.Query().Get("code_challenge")
+	codeChallengeMethod := r.URL.Query().Get("code_challenge_method")
+
+	log.Printf("OAuth authorize params: client_id=%s, redirect_uri=%s, response_type=%s, scope=%s, code_challenge_method=%s",
+		clientID, redirectURI, responseType, scope, codeChallengeMethod)
+
+	// Validate required parameters
+	if responseType != "code" {
+		s.oauthError(w, r, redirectURI, "unsupported_response_type", "Only 'code' response type is supported", state)
+		return
+	}
+
+	if codeChallengeMethod != "" && codeChallengeMethod != "S256" {
+		s.oauthError(w, r, redirectURI, "invalid_request", "Only S256 code challenge method is supported", state)
+		return
+	}
+
+	if redirectURI == "" {
+		http.Error(w, "redirect_uri is required", http.StatusBadRequest)
+		return
+	}
+
+	// Generate authorization code
+	code := s.generateCode()
+
+	// Store authorization code
+	s.mu.Lock()
+	s.authCodes[code] = &AuthCode{
+		Code:          code,
+		ClientID:      clientID,
+		RedirectURI:   redirectURI,
+		CodeChallenge: codeChallenge,
+		Scope:         scope,
+		ExpiresAt:     time.Now().Add(10 * time.Minute),
+	}
+	s.mu.Unlock()
+
+	log.Printf("OAuth: Generated auth code for client %s", clientID)
+
+	// Redirect back with code
+	redirectURL, err := url.Parse(redirectURI)
+	if err != nil {
+		http.Error(w, "Invalid redirect_uri", http.StatusBadRequest)
+		return
+	}
+
+	q := redirectURL.Query()
+	q.Set("code", code)
+	if state != "" {
+		q.Set("state", state)
+	}
+	redirectURL.RawQuery = q.Encode()
+
+	log.Printf("OAuth: Redirecting to %s", redirectURL.String())
+	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+}
+
+// OAuth 2.1 Token Endpoint
+func (s *MCPServer) handleToken(w http.ResponseWriter, r *http.Request) {
+	log.Printf("OAuth /token request: %s", r.Method)
+
+	// CORS
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse form data
+	if err := r.ParseForm(); err != nil {
+		s.tokenError(w, "invalid_request", "Failed to parse form")
+		return
+	}
+
+	grantType := r.FormValue("grant_type")
+	code := r.FormValue("code")
+	redirectURI := r.FormValue("redirect_uri")
+	clientID := r.FormValue("client_id")
+	clientSecret := r.FormValue("client_secret")
+	codeVerifier := r.FormValue("code_verifier")
+
+	// Also check Basic auth for client credentials
+	if clientID == "" || clientSecret == "" {
+		if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Basic ") {
+			decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(authHeader, "Basic "))
+			if err == nil {
+				parts := strings.SplitN(string(decoded), ":", 2)
+				if len(parts) == 2 {
+					clientID = parts[0]
+					clientSecret = parts[1]
+				}
+			}
+		}
+	}
+
+	log.Printf("OAuth token request: grant_type=%s, client_id=%s, code=%s", grantType, clientID, code[:min(10, len(code))]+"...")
+
+	if grantType != "authorization_code" {
+		s.tokenError(w, "unsupported_grant_type", "Only authorization_code grant is supported")
+		return
+	}
+
+	// Validate client_secret
+	if clientSecret != s.mcpToken {
+		log.Printf("OAuth: Invalid client_secret")
+		s.tokenError(w, "invalid_client", "Invalid client credentials")
+		return
+	}
+
+	// Look up authorization code
+	s.mu.Lock()
+	authCode, exists := s.authCodes[code]
+	if exists {
+		delete(s.authCodes, code) // One-time use
+	}
+	s.mu.Unlock()
+
+	if !exists {
+		log.Printf("OAuth: Code not found")
+		s.tokenError(w, "invalid_grant", "Invalid or expired authorization code")
+		return
+	}
+
+	if time.Now().After(authCode.ExpiresAt) {
+		log.Printf("OAuth: Code expired")
+		s.tokenError(w, "invalid_grant", "Authorization code expired")
+		return
+	}
+
+	// Validate redirect_uri
+	if redirectURI != authCode.RedirectURI {
+		log.Printf("OAuth: Redirect URI mismatch: %s != %s", redirectURI, authCode.RedirectURI)
+		s.tokenError(w, "invalid_grant", "Redirect URI mismatch")
+		return
+	}
+
+	// Validate PKCE code_verifier
+	if authCode.CodeChallenge != "" {
+		if codeVerifier == "" {
+			log.Printf("OAuth: Missing code_verifier")
+			s.tokenError(w, "invalid_grant", "code_verifier required")
+			return
+		}
+
+		// S256: BASE64URL(SHA256(code_verifier)) == code_challenge
+		h := sha256.Sum256([]byte(codeVerifier))
+		computedChallenge := base64.RawURLEncoding.EncodeToString(h[:])
+
+		if computedChallenge != authCode.CodeChallenge {
+			log.Printf("OAuth: PKCE verification failed")
+			log.Printf("  code_verifier: %s", codeVerifier[:min(20, len(codeVerifier))]+"...")
+			log.Printf("  computed challenge: %s", computedChallenge)
+			log.Printf("  expected challenge: %s", authCode.CodeChallenge)
+			s.tokenError(w, "invalid_grant", "PKCE verification failed")
+			return
+		}
+	}
+
+	// Generate access token
+	accessToken := s.generateToken()
+
+	// Store token
+	s.mu.Lock()
+	s.accessTokens[accessToken] = &AccessToken{
+		Token:     accessToken,
+		ClientID:  clientID,
+		Scope:     authCode.Scope,
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	s.mu.Unlock()
+
+	log.Printf("OAuth: Issued access token for client %s", clientID)
+
+	// Return token response
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+
+	response := map[string]interface{}{
+		"access_token": accessToken,
+		"token_type":   "Bearer",
+		"expires_in":   86400,
+		"scope":        authCode.Scope,
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
+func (s *MCPServer) oauthError(w http.ResponseWriter, r *http.Request, redirectURI, errorCode, description, state string) {
+	if redirectURI == "" {
+		http.Error(w, description, http.StatusBadRequest)
+		return
+	}
+
+	redirectURL, err := url.Parse(redirectURI)
+	if err != nil {
+		http.Error(w, description, http.StatusBadRequest)
+		return
+	}
+
+	q := redirectURL.Query()
+	q.Set("error", errorCode)
+	q.Set("error_description", description)
+	if state != "" {
+		q.Set("state", state)
+	}
+	redirectURL.RawQuery = q.Encode()
+
+	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+}
+
+func (s *MCPServer) tokenError(w http.ResponseWriter, errorCode, description string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+
+	response := map[string]string{
+		"error":             errorCode,
+		"error_description": description,
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
+func (s *MCPServer) generateCode() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func (s *MCPServer) generateToken() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // handleHTTP handles regular HTTP POST requests
@@ -175,6 +524,7 @@ func (s *MCPServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Check authentication
 	if !s.checkAuth(r) {
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata="%s/.well-known/oauth-protected-resource"`, s.baseURL))
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -213,6 +563,7 @@ func (s *MCPServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Check authentication
 	if !s.checkAuth(r) {
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata="%s/.well-known/oauth-protected-resource"`, s.baseURL))
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -262,21 +613,34 @@ func (s *MCPServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 }
 
-// checkAuth verifies Bearer token or Basic auth
+// checkAuth verifies Bearer token (OAuth access token or legacy token)
 func (s *MCPServer) checkAuth(r *http.Request) bool {
-	if s.mcpToken == "" {
-		return true // No auth required if token not configured
-	}
-
 	auth := r.Header.Get("Authorization")
 	if auth == "" {
+		// If no auth configured, allow access
+		if s.mcpToken == "" {
+			return true
+		}
 		return false
 	}
 
 	// Check Bearer token
 	if strings.HasPrefix(auth, "Bearer ") {
 		token := strings.TrimPrefix(auth, "Bearer ")
-		return token == s.mcpToken
+
+		// Check if it's a valid OAuth access token
+		s.mu.RLock()
+		accessToken, exists := s.accessTokens[token]
+		s.mu.RUnlock()
+
+		if exists && time.Now().Before(accessToken.ExpiresAt) {
+			return true
+		}
+
+		// Fall back to legacy simple token check
+		if token == s.mcpToken {
+			return true
+		}
 	}
 
 	return false
@@ -507,6 +871,13 @@ func (s *MCPServer) apiRequest(method, path string, body interface{}) (string, b
 	}
 
 	return prettyData.String(), false
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func main() {

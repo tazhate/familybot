@@ -29,6 +29,8 @@ spec:
           env:
             - name: MCP_HTTP_ADDR
               value: ":8081"
+            - name: MCP_BASE_URL
+              value: "https://{{ .Values.mcp.ingress.host }}"
             - name: FAMILYBOT_API_URL
               value: "http://{{ include "familybot.fullname" . }}:{{ .Values.service.port }}"
             - name: FAMILYBOT_API_USERNAME
