@@ -118,9 +118,9 @@ type MCPServer struct {
 	apiURL       string
 	apiUsername  string
 	apiPassword  string
-	mcpToken     string // Legacy simple token (also used as client_secret)
-	clientID     string // OAuth client ID
-	baseURL      string // Server's base URL for OAuth
+	mcpTokens    []string // Valid tokens (comma-separated in env, used as client_secret)
+	clientID     string   // OAuth client ID
+	baseURL      string   // Server's base URL for OAuth
 	authCodes    map[string]*AuthCode
 	accessTokens map[string]*AccessToken
 	mu           sync.RWMutex
@@ -142,11 +142,23 @@ func NewMCPServer() *MCPServer {
 		clientID = "familybot"
 	}
 
+	// Parse comma-separated tokens
+	var tokens []string
+	tokenStr := os.Getenv("FAMILYBOT_MCP_TOKEN")
+	if tokenStr != "" {
+		for _, t := range strings.Split(tokenStr, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				tokens = append(tokens, t)
+			}
+		}
+	}
+
 	return &MCPServer{
 		apiURL:       apiURL,
 		apiUsername:  os.Getenv("FAMILYBOT_API_USERNAME"),
 		apiPassword:  os.Getenv("FAMILYBOT_API_PASSWORD"),
-		mcpToken:     os.Getenv("FAMILYBOT_MCP_TOKEN"),
+		mcpTokens:    tokens,
 		clientID:     clientID,
 		baseURL:      baseURL,
 		authCodes:    make(map[string]*AuthCode),
@@ -373,8 +385,15 @@ func (s *MCPServer) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate client_secret
-	if clientSecret != s.mcpToken {
+	// Validate client_secret against list of valid tokens
+	validSecret := false
+	for _, token := range s.mcpTokens {
+		if clientSecret == token {
+			validSecret = true
+			break
+		}
+	}
+	if !validSecret {
 		log.Printf("OAuth: Invalid client_secret")
 		s.tokenError(w, "invalid_client", "Invalid client credentials")
 		return
@@ -618,7 +637,7 @@ func (s *MCPServer) checkAuth(r *http.Request) bool {
 	auth := r.Header.Get("Authorization")
 	if auth == "" {
 		// If no auth configured, allow access
-		if s.mcpToken == "" {
+		if len(s.mcpTokens) == 0 {
 			return true
 		}
 		return false
@@ -638,8 +657,10 @@ func (s *MCPServer) checkAuth(r *http.Request) bool {
 		}
 
 		// Fall back to legacy simple token check
-		if token == s.mcpToken {
-			return true
+		for _, validToken := range s.mcpTokens {
+			if token == validToken {
+				return true
+			}
 		}
 	}
 
