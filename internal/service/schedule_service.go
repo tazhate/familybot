@@ -350,6 +350,9 @@ func (s *ScheduleService) formatWeekScheduleInternal(events []*domain.WeeklyEven
 			if e.IsShared {
 				marks += " 👨‍👩‍👧‍👦"
 			}
+			if e.IsTrackable {
+				marks += " ☑️"
+			}
 			if showIDs {
 				sb.WriteString(fmt.Sprintf("  <code>#%d</code> %s %s%s\n", e.ID, timeStr, e.Title, marks))
 			} else {
@@ -360,6 +363,87 @@ func (s *ScheduleService) formatWeekScheduleInternal(events []*domain.WeeklyEven
 	}
 
 	return sb.String()
+}
+
+// SetTrackable updates the is_trackable flag for an event
+func (s *ScheduleService) SetTrackable(eventID int64, userID int64, isTrackable bool) error {
+	event, err := s.storage.GetWeeklyEvent(eventID)
+	if err != nil {
+		return err
+	}
+	if event == nil {
+		return errors.New("событие не найдено")
+	}
+	if event.UserID != userID {
+		return errors.New("нет доступа")
+	}
+	return s.storage.UpdateWeeklyEventTrackable(eventID, isTrackable)
+}
+
+// UpdateTitle updates the title of an event
+func (s *ScheduleService) UpdateTitle(eventID int64, userID int64, title string) error {
+	if title == "" {
+		return errors.New("название не может быть пустым")
+	}
+	event, err := s.storage.GetWeeklyEvent(eventID)
+	if err != nil {
+		return err
+	}
+	if event == nil {
+		return errors.New("событие не найдено")
+	}
+	if event.UserID != userID {
+		return errors.New("нет доступа")
+	}
+	return s.storage.UpdateWeeklyEventTitle(eventID, title)
+}
+
+// UpdateDay updates the day of an event
+func (s *ScheduleService) UpdateDay(eventID int64, userID int64, day domain.Weekday) error {
+	event, err := s.storage.GetWeeklyEvent(eventID)
+	if err != nil {
+		return err
+	}
+	if event == nil {
+		return errors.New("событие не найдено")
+	}
+	if event.UserID != userID {
+		return errors.New("нет доступа")
+	}
+	if event.IsFloating {
+		return errors.New("для плавающих событий используйте /floating")
+	}
+	return s.storage.UpdateWeeklyEventDay(eventID, day)
+}
+
+// UpdateTime updates the time of an event
+func (s *ScheduleService) UpdateTime(eventID int64, userID int64, timeStart, timeEnd string) error {
+	event, err := s.storage.GetWeeklyEvent(eventID)
+	if err != nil {
+		return err
+	}
+	if event == nil {
+		return errors.New("событие не найдено")
+	}
+	if event.UserID != userID {
+		return errors.New("нет доступа")
+	}
+	return s.storage.UpdateWeeklyEventTime(eventID, timeStart, timeEnd)
+}
+
+// LinkChecklist links a checklist to a weekly event
+func (s *ScheduleService) LinkChecklist(eventID int64, userID int64, checklistID *int64) error {
+	event, err := s.storage.GetWeeklyEvent(eventID)
+	if err != nil {
+		return err
+	}
+	if event == nil {
+		return errors.New("событие не найдено")
+	}
+	if event.UserID != userID {
+		return errors.New("нет доступа")
+	}
+	return s.storage.UpdateWeeklyEventChecklist(eventID, checklistID)
 }
 
 // FormatDaySchedule formats events for a single day

@@ -175,6 +175,33 @@ func (s *Storage) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_task_reminders_sent ON task_reminders(sent_at)`,
 		// Shared weekly events
 		`ALTER TABLE weekly_events ADD COLUMN is_shared INTEGER DEFAULT 0`,
+		// Link checklist to weekly event
+		`ALTER TABLE weekly_events ADD COLUMN checklist_id INTEGER REFERENCES checklists(id)`,
+		// Trackable weekly events (create tasks that can be marked done)
+		`ALTER TABLE weekly_events ADD COLUMN is_trackable INTEGER DEFAULT 0`,
+		// Calendar events (synced from Apple Calendar)
+		`CREATE TABLE IF NOT EXISTS calendar_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			caldav_uid TEXT UNIQUE,
+			title TEXT NOT NULL,
+			description TEXT DEFAULT '',
+			location TEXT DEFAULT '',
+			start_time DATETIME NOT NULL,
+			end_time DATETIME,
+			all_day INTEGER DEFAULT 0,
+			is_shared INTEGER DEFAULT 1,
+			synced_at DATETIME,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (user_id) REFERENCES users(id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_calendar_events_start ON calendar_events(start_time)`,
+		`CREATE INDEX IF NOT EXISTS idx_calendar_events_caldav ON calendar_events(caldav_uid)`,
+		`CREATE INDEX IF NOT EXISTS idx_calendar_events_user ON calendar_events(user_id)`,
+		// Todoist sync
+		`ALTER TABLE tasks ADD COLUMN todoist_id TEXT DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_tasks_todoist ON tasks(todoist_id)`,
 	}
 
 	for _, m := range migrations {
@@ -228,6 +255,25 @@ func (s *Storage) GetUserByID(id int64) (*domain.User, error) {
 	return u, err
 }
 
+// ListUsers returns all users
+func (s *Storage) ListUsers() ([]*domain.User, error) {
+	rows, err := s.db.Query(`SELECT id, telegram_id, name, role, created_at FROM users ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []*domain.User
+	for rows.Next() {
+		u := &domain.User{}
+		if err := rows.Scan(&u.ID, &u.TelegramID, &u.Name, &u.Role, &u.CreatedAt); err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}
+
 // GetUser is an alias for GetUserByID
 func (s *Storage) GetUser(id int64) (*domain.User, error) {
 	return s.GetUserByID(id)
@@ -250,9 +296,9 @@ func (s *Storage) GetUserByName(name string) (*domain.User, error) {
 
 func (s *Storage) CreateTask(t *domain.Task) error {
 	res, err := s.db.Exec(
-		`INSERT INTO tasks (user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, repeat_type, repeat_time, repeat_week_num)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		t.UserID, t.ChatID, t.AssignedTo, t.PersonID, t.Title, t.Description, t.Priority, t.IsShared, t.DueDate, t.RepeatType, t.RepeatTime, t.RepeatWeekNum,
+		`INSERT INTO tasks (user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, repeat_type, repeat_time, repeat_week_num, todoist_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.UserID, t.ChatID, t.AssignedTo, t.PersonID, t.Title, t.Description, t.Priority, t.IsShared, t.DueDate, t.RepeatType, t.RepeatTime, t.RepeatWeekNum, t.TodoistID,
 	)
 	if err != nil {
 		return err
@@ -263,21 +309,55 @@ func (s *Storage) CreateTask(t *domain.Task) error {
 	return nil
 }
 
+// TaskExistsForEventToday checks if task with given title exists for user with due_date = today
+func (s *Storage) TaskExistsForEventToday(userID int64, title string, todayStart time.Time) (bool, error) {
+	todayEnd := todayStart.Add(24 * time.Hour)
+	var count int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM tasks WHERE user_id = ? AND title = ? AND due_date >= ? AND due_date < ? AND done_at IS NULL`,
+		userID, title, todayStart, todayEnd,
+	).Scan(&count)
+	return count > 0, err
+}
+
 func (s *Storage) GetTask(id int64) (*domain.Task, error) {
 	t := &domain.Task{}
 	err := s.db.QueryRow(
-		`SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num
+		`SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num, COALESCE(todoist_id, '')
 		 FROM tasks WHERE id = ?`,
 		id,
-	).Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum)
+	).Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	return t, err
 }
 
+// GetTaskByTodoistID returns a task by its Todoist ID
+func (s *Storage) GetTaskByTodoistID(todoistID string) (*domain.Task, error) {
+	if todoistID == "" {
+		return nil, nil
+	}
+	t := &domain.Task{}
+	err := s.db.QueryRow(
+		`SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num, COALESCE(todoist_id, '')
+		 FROM tasks WHERE todoist_id = ?`,
+		todoistID,
+	).Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return t, err
+}
+
+// UpdateTaskTodoistID sets the Todoist ID for a task
+func (s *Storage) UpdateTaskTodoistID(taskID int64, todoistID string) error {
+	_, err := s.db.Exec(`UPDATE tasks SET todoist_id = ? WHERE id = ?`, todoistID, taskID)
+	return err
+}
+
 func (s *Storage) ListTasksByUser(userID int64, includeShared bool, includeDone bool) ([]*domain.Task, error) {
-	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num
+	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num, COALESCE(todoist_id, '')
 		FROM tasks WHERE (user_id = ? OR assigned_to = ?`
 	if includeShared {
 		query += ` OR is_shared = 1`
@@ -299,7 +379,7 @@ func (s *Storage) ListTasksByUser(userID int64, includeShared bool, includeDone 
 	var tasks []*domain.Task
 	for rows.Next() {
 		t := &domain.Task{}
-		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum); err != nil {
+		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
@@ -309,7 +389,7 @@ func (s *Storage) ListTasksByUser(userID int64, includeShared bool, includeDone 
 
 // ListTasksByChat returns tasks for a specific chat context (including shared tasks)
 func (s *Storage) ListTasksByChat(chatID int64, includeDone bool) ([]*domain.Task, error) {
-	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num
+	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num, COALESCE(todoist_id, '')
 		FROM tasks WHERE (chat_id = ? OR is_shared = 1)`
 	if !includeDone {
 		query += ` AND done_at IS NULL`
@@ -327,7 +407,7 @@ func (s *Storage) ListTasksByChat(chatID int64, includeDone bool) ([]*domain.Tas
 	var tasks []*domain.Task
 	for rows.Next() {
 		t := &domain.Task{}
-		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum); err != nil {
+		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
@@ -337,7 +417,7 @@ func (s *Storage) ListTasksByChat(chatID int64, includeDone bool) ([]*domain.Tas
 
 // ListSharedTasks returns all shared tasks (is_shared = true)
 func (s *Storage) ListSharedTasks(includeDone bool) ([]*domain.Task, error) {
-	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num
+	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num, COALESCE(todoist_id, '')
 		FROM tasks WHERE is_shared = 1`
 	if !includeDone {
 		query += ` AND done_at IS NULL`
@@ -355,7 +435,7 @@ func (s *Storage) ListSharedTasks(includeDone bool) ([]*domain.Task, error) {
 	var tasks []*domain.Task
 	for rows.Next() {
 		t := &domain.Task{}
-		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum); err != nil {
+		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
@@ -378,7 +458,7 @@ func (s *Storage) ListTasksForToday(userID int64) ([]*domain.Task, error) {
 	// 2. Urgent with no due_date
 	// 3. Urgent with due_date today or in the past (overdue)
 	rows, err := s.db.Query(
-		`SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num
+		`SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num, COALESCE(todoist_id, '')
 		 FROM tasks
 		 WHERE (user_id = ? OR assigned_to = ? OR is_shared = 1)
 		   AND done_at IS NULL
@@ -399,7 +479,7 @@ func (s *Storage) ListTasksForToday(userID int64) ([]*domain.Task, error) {
 	var tasks []*domain.Task
 	for rows.Next() {
 		t := &domain.Task{}
-		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum); err != nil {
+		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
@@ -417,7 +497,7 @@ func (s *Storage) ListTasksForTodayByChat(chatID int64) ([]*domain.Task, error) 
 	// 2. Urgent with no due_date
 	// 3. Urgent with due_date today or in the past (overdue)
 	rows, err := s.db.Query(
-		`SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num
+		`SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num, COALESCE(todoist_id, '')
 		 FROM tasks
 		 WHERE (chat_id = ? OR is_shared = 1)
 		   AND done_at IS NULL
@@ -438,7 +518,7 @@ func (s *Storage) ListTasksForTodayByChat(chatID int64) ([]*domain.Task, error) 
 	var tasks []*domain.Task
 	for rows.Next() {
 		t := &domain.Task{}
-		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum); err != nil {
+		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
@@ -448,7 +528,7 @@ func (s *Storage) ListTasksForTodayByChat(chatID int64) ([]*domain.Task, error) 
 
 // ListTasksByPerson returns tasks linked to a specific person
 func (s *Storage) ListTasksByPerson(personID int64, includeDone bool) ([]*domain.Task, error) {
-	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num
+	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num, COALESCE(todoist_id, '')
 		FROM tasks WHERE person_id = ?`
 	if !includeDone {
 		query += ` AND done_at IS NULL`
@@ -464,7 +544,7 @@ func (s *Storage) ListTasksByPerson(personID int64, includeDone bool) ([]*domain
 	var tasks []*domain.Task
 	for rows.Next() {
 		t := &domain.Task{}
-		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum); err != nil {
+		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
@@ -528,7 +608,7 @@ func (s *Storage) ListUrgentTasksForReminder() ([]*domain.Task, error) {
 	twoHoursAgo := time.Now().Add(-2 * time.Hour)
 	now := time.Now()
 
-	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num
+	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num, COALESCE(todoist_id, '')
 		FROM tasks
 		WHERE priority = 'urgent'
 		AND done_at IS NULL
@@ -546,7 +626,7 @@ func (s *Storage) ListUrgentTasksForReminder() ([]*domain.Task, error) {
 	var tasks []*domain.Task
 	for rows.Next() {
 		t := &domain.Task{}
-		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum); err != nil {
+		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
@@ -571,7 +651,7 @@ func (s *Storage) SnoozeTask(taskID int64, until time.Time) error {
 func (s *Storage) ListRepeatingTasksByTime(repeatTime string) ([]*domain.Task, error) {
 	now := time.Now()
 
-	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num
+	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num, COALESCE(todoist_id, '')
 		FROM tasks
 		WHERE repeat_time = ?
 		AND repeat_type != ''
@@ -587,7 +667,7 @@ func (s *Storage) ListRepeatingTasksByTime(repeatTime string) ([]*domain.Task, e
 	var tasks []*domain.Task
 	for rows.Next() {
 		t := &domain.Task{}
-		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum); err != nil {
+		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
@@ -851,9 +931,9 @@ func (s *Storage) DeletePerson(id int64) error {
 
 func (s *Storage) CreateWeeklyEvent(e *domain.WeeklyEvent) error {
 	res, err := s.db.Exec(
-		`INSERT INTO weekly_events (user_id, day_of_week, time_start, time_end, title, person_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.UserID, e.DayOfWeek, e.TimeStart, e.TimeEnd, e.Title, e.PersonID, e.ReminderBefore, e.IsFloating, e.FloatingDays, e.ConfirmedDay, e.ConfirmedWeek, e.IsShared,
+		`INSERT INTO weekly_events (user_id, day_of_week, time_start, time_end, title, person_id, checklist_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, is_trackable)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.UserID, e.DayOfWeek, e.TimeStart, e.TimeEnd, e.Title, e.PersonID, e.ChecklistID, e.ReminderBefore, e.IsFloating, e.FloatingDays, e.ConfirmedDay, e.ConfirmedWeek, e.IsShared, e.IsTrackable,
 	)
 	if err != nil {
 		return err
@@ -867,10 +947,10 @@ func (s *Storage) CreateWeeklyEvent(e *domain.WeeklyEvent) error {
 func (s *Storage) GetWeeklyEvent(id int64) (*domain.WeeklyEvent, error) {
 	e := &domain.WeeklyEvent{}
 	err := s.db.QueryRow(
-		`SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, created_at
+		`SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, checklist_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, is_trackable, created_at
 		 FROM weekly_events WHERE id = ?`,
 		id,
-	).Scan(&e.ID, &e.UserID, &e.DayOfWeek, &e.TimeStart, &e.TimeEnd, &e.Title, &e.PersonID, &e.ReminderBefore, &e.IsFloating, &e.FloatingDays, &e.ConfirmedDay, &e.ConfirmedWeek, &e.IsShared, &e.CreatedAt)
+	).Scan(&e.ID, &e.UserID, &e.DayOfWeek, &e.TimeStart, &e.TimeEnd, &e.Title, &e.PersonID, &e.ChecklistID, &e.ReminderBefore, &e.IsFloating, &e.FloatingDays, &e.ConfirmedDay, &e.ConfirmedWeek, &e.IsShared, &e.IsTrackable, &e.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -878,7 +958,7 @@ func (s *Storage) GetWeeklyEvent(id int64) (*domain.WeeklyEvent, error) {
 }
 
 func (s *Storage) ListWeeklyEventsByUser(userID int64, includeShared bool) ([]*domain.WeeklyEvent, error) {
-	query := `SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, created_at
+	query := `SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, checklist_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, is_trackable, created_at
 		 FROM weekly_events WHERE user_id = ?`
 	if includeShared {
 		query += ` OR is_shared = 1`
@@ -894,7 +974,7 @@ func (s *Storage) ListWeeklyEventsByUser(userID int64, includeShared bool) ([]*d
 	var events []*domain.WeeklyEvent
 	for rows.Next() {
 		e := &domain.WeeklyEvent{}
-		if err := rows.Scan(&e.ID, &e.UserID, &e.DayOfWeek, &e.TimeStart, &e.TimeEnd, &e.Title, &e.PersonID, &e.ReminderBefore, &e.IsFloating, &e.FloatingDays, &e.ConfirmedDay, &e.ConfirmedWeek, &e.IsShared, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.UserID, &e.DayOfWeek, &e.TimeStart, &e.TimeEnd, &e.Title, &e.PersonID, &e.ChecklistID, &e.ReminderBefore, &e.IsFloating, &e.FloatingDays, &e.ConfirmedDay, &e.ConfirmedWeek, &e.IsShared, &e.IsTrackable, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		events = append(events, e)
@@ -903,10 +983,10 @@ func (s *Storage) ListWeeklyEventsByUser(userID int64, includeShared bool) ([]*d
 }
 
 func (s *Storage) ListWeeklyEventsByDay(userID int64, dayOfWeek domain.Weekday, includeShared bool) ([]*domain.WeeklyEvent, error) {
-	query := `SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, created_at
+	query := `SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, checklist_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, is_trackable, created_at
 		 FROM weekly_events WHERE (user_id = ? OR is_shared = 1) AND day_of_week = ? ORDER BY time_start`
 	if !includeShared {
-		query = `SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, created_at
+		query = `SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, checklist_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, is_trackable, created_at
 		 FROM weekly_events WHERE user_id = ? AND day_of_week = ? ORDER BY time_start`
 	}
 
@@ -919,7 +999,7 @@ func (s *Storage) ListWeeklyEventsByDay(userID int64, dayOfWeek domain.Weekday, 
 	var events []*domain.WeeklyEvent
 	for rows.Next() {
 		e := &domain.WeeklyEvent{}
-		if err := rows.Scan(&e.ID, &e.UserID, &e.DayOfWeek, &e.TimeStart, &e.TimeEnd, &e.Title, &e.PersonID, &e.ReminderBefore, &e.IsFloating, &e.FloatingDays, &e.ConfirmedDay, &e.ConfirmedWeek, &e.IsShared, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.UserID, &e.DayOfWeek, &e.TimeStart, &e.TimeEnd, &e.Title, &e.PersonID, &e.ChecklistID, &e.ReminderBefore, &e.IsFloating, &e.FloatingDays, &e.ConfirmedDay, &e.ConfirmedWeek, &e.IsShared, &e.IsTrackable, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		events = append(events, e)
@@ -953,7 +1033,7 @@ func (s *Storage) UpdateWeeklyEventConfirmedDay(id int64, confirmedDay *int, con
 // ListFloatingEvents returns all floating events for a user
 func (s *Storage) ListFloatingEvents(userID int64) ([]*domain.WeeklyEvent, error) {
 	rows, err := s.db.Query(
-		`SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, created_at
+		`SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, checklist_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, is_trackable, created_at
 		 FROM weekly_events WHERE user_id = ? AND is_floating = 1 ORDER BY time_start`,
 		userID,
 	)
@@ -965,7 +1045,7 @@ func (s *Storage) ListFloatingEvents(userID int64) ([]*domain.WeeklyEvent, error
 	var events []*domain.WeeklyEvent
 	for rows.Next() {
 		e := &domain.WeeklyEvent{}
-		if err := rows.Scan(&e.ID, &e.UserID, &e.DayOfWeek, &e.TimeStart, &e.TimeEnd, &e.Title, &e.PersonID, &e.ReminderBefore, &e.IsFloating, &e.FloatingDays, &e.ConfirmedDay, &e.ConfirmedWeek, &e.IsShared, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.UserID, &e.DayOfWeek, &e.TimeStart, &e.TimeEnd, &e.Title, &e.PersonID, &e.ChecklistID, &e.ReminderBefore, &e.IsFloating, &e.FloatingDays, &e.ConfirmedDay, &e.ConfirmedWeek, &e.IsShared, &e.IsTrackable, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		events = append(events, e)
@@ -976,7 +1056,7 @@ func (s *Storage) ListFloatingEvents(userID int64) ([]*domain.WeeklyEvent, error
 // ListEventsWithReminders returns all events with reminder_before > 0
 func (s *Storage) ListEventsWithReminders() ([]*domain.WeeklyEvent, error) {
 	rows, err := s.db.Query(
-		`SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, created_at
+		`SELECT id, user_id, day_of_week, time_start, time_end, title, person_id, checklist_id, reminder_before, is_floating, floating_days, confirmed_day, confirmed_week, is_shared, is_trackable, created_at
 		 FROM weekly_events WHERE reminder_before > 0 ORDER BY day_of_week, time_start`,
 	)
 	if err != nil {
@@ -987,7 +1067,7 @@ func (s *Storage) ListEventsWithReminders() ([]*domain.WeeklyEvent, error) {
 	var events []*domain.WeeklyEvent
 	for rows.Next() {
 		e := &domain.WeeklyEvent{}
-		if err := rows.Scan(&e.ID, &e.UserID, &e.DayOfWeek, &e.TimeStart, &e.TimeEnd, &e.Title, &e.PersonID, &e.ReminderBefore, &e.IsFloating, &e.FloatingDays, &e.ConfirmedDay, &e.ConfirmedWeek, &e.IsShared, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.UserID, &e.DayOfWeek, &e.TimeStart, &e.TimeEnd, &e.Title, &e.PersonID, &e.ChecklistID, &e.ReminderBefore, &e.IsFloating, &e.FloatingDays, &e.ConfirmedDay, &e.ConfirmedWeek, &e.IsShared, &e.IsTrackable, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		events = append(events, e)
@@ -995,9 +1075,39 @@ func (s *Storage) ListEventsWithReminders() ([]*domain.WeeklyEvent, error) {
 	return events, nil
 }
 
+// UpdateWeeklyEventChecklist links a checklist to a weekly event
+func (s *Storage) UpdateWeeklyEventChecklist(eventID int64, checklistID *int64) error {
+	_, err := s.db.Exec(`UPDATE weekly_events SET checklist_id = ? WHERE id = ?`, checklistID, eventID)
+	return err
+}
+
 // UpdateWeeklyEventShared updates the is_shared flag for a weekly event
 func (s *Storage) UpdateWeeklyEventShared(eventID int64, isShared bool) error {
 	_, err := s.db.Exec(`UPDATE weekly_events SET is_shared = ? WHERE id = ?`, isShared, eventID)
+	return err
+}
+
+// UpdateWeeklyEventTrackable updates the is_trackable flag for a weekly event
+func (s *Storage) UpdateWeeklyEventTrackable(eventID int64, isTrackable bool) error {
+	_, err := s.db.Exec(`UPDATE weekly_events SET is_trackable = ? WHERE id = ?`, isTrackable, eventID)
+	return err
+}
+
+// UpdateWeeklyEventTitle updates the title of a weekly event
+func (s *Storage) UpdateWeeklyEventTitle(eventID int64, title string) error {
+	_, err := s.db.Exec(`UPDATE weekly_events SET title = ? WHERE id = ?`, title, eventID)
+	return err
+}
+
+// UpdateWeeklyEventDay updates the day of week for a weekly event
+func (s *Storage) UpdateWeeklyEventDay(eventID int64, day domain.Weekday) error {
+	_, err := s.db.Exec(`UPDATE weekly_events SET day_of_week = ? WHERE id = ?`, day, eventID)
+	return err
+}
+
+// UpdateWeeklyEventTime updates the time of a weekly event
+func (s *Storage) UpdateWeeklyEventTime(eventID int64, timeStart, timeEnd string) error {
+	_, err := s.db.Exec(`UPDATE weekly_events SET time_start = ?, time_end = ? WHERE id = ?`, timeStart, timeEnd, eventID)
 	return err
 }
 
@@ -1182,7 +1292,7 @@ func (s *Storage) DeleteChecklist(id int64) error {
 
 // ListCompletedTasks returns completed tasks ordered by completion time
 func (s *Storage) ListCompletedTasks(userID int64, limit int) ([]*domain.Task, error) {
-	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num
+	query := `SELECT id, user_id, chat_id, assigned_to, person_id, title, description, priority, is_shared, due_date, done_at, created_at, reminder_count, last_reminded_at, snooze_until, repeat_type, repeat_time, repeat_week_num, COALESCE(todoist_id, '')
 		FROM tasks
 		WHERE (user_id = ? OR assigned_to = ?)
 		AND done_at IS NOT NULL
@@ -1198,7 +1308,7 @@ func (s *Storage) ListCompletedTasks(userID int64, limit int) ([]*domain.Task, e
 	var tasks []*domain.Task
 	for rows.Next() {
 		t := &domain.Task{}
-		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum); err != nil {
+		if err := rows.Scan(&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description, &t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt, &t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
@@ -1309,7 +1419,7 @@ func (s *Storage) GetPendingTaskReminders() ([]*domain.TaskReminder, []*domain.T
 		SELECT tr.id, tr.task_id, tr.remind_before, tr.sent_at,
 		       t.id, t.user_id, t.chat_id, t.assigned_to, t.person_id, t.title, t.description,
 		       t.priority, t.is_shared, t.due_date, t.done_at, t.created_at,
-		       t.reminder_count, t.last_reminded_at, t.snooze_until, t.repeat_type, t.repeat_time, t.repeat_week_num
+		       t.reminder_count, t.last_reminded_at, t.snooze_until, t.repeat_type, t.repeat_time, t.repeat_week_num, COALESCE(t.todoist_id, '')
 		FROM task_reminders tr
 		JOIN tasks t ON tr.task_id = t.id
 		WHERE tr.sent_at IS NULL
@@ -1331,7 +1441,7 @@ func (s *Storage) GetPendingTaskReminders() ([]*domain.TaskReminder, []*domain.T
 			&r.ID, &r.TaskID, &r.RemindBefore, &r.SentAt,
 			&t.ID, &t.UserID, &t.ChatID, &t.AssignedTo, &t.PersonID, &t.Title, &t.Description,
 			&t.Priority, &t.IsShared, &t.DueDate, &t.DoneAt, &t.CreatedAt,
-			&t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum,
+			&t.ReminderCount, &t.LastRemindedAt, &t.SnoozeUntil, &t.RepeatType, &t.RepeatTime, &t.RepeatWeekNum, &t.TodoistID,
 		); err != nil {
 			return nil, nil, err
 		}
@@ -1339,4 +1449,168 @@ func (s *Storage) GetPendingTaskReminders() ([]*domain.TaskReminder, []*domain.T
 		tasks = append(tasks, t)
 	}
 	return reminders, tasks, nil
+}
+
+// === Calendar Events ===
+
+// CreateCalendarEvent creates a new calendar event
+func (s *Storage) CreateCalendarEvent(e *domain.CalendarEvent) error {
+	now := time.Now()
+	res, err := s.db.Exec(
+		`INSERT INTO calendar_events (user_id, caldav_uid, title, description, location, start_time, end_time, all_day, is_shared, synced_at, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.UserID, e.CalDAVUID, e.Title, e.Description, e.Location, e.StartTime, e.EndTime, e.AllDay, e.IsShared, e.SyncedAt, now, now,
+	)
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	e.ID = id
+	e.CreatedAt = now
+	e.UpdatedAt = now
+	return nil
+}
+
+// GetCalendarEvent returns a calendar event by ID
+func (s *Storage) GetCalendarEvent(id int64) (*domain.CalendarEvent, error) {
+	e := &domain.CalendarEvent{}
+	err := s.db.QueryRow(
+		`SELECT id, user_id, caldav_uid, title, description, location, start_time, end_time, all_day, is_shared, synced_at, created_at, updated_at
+		 FROM calendar_events WHERE id = ?`,
+		id,
+	).Scan(&e.ID, &e.UserID, &e.CalDAVUID, &e.Title, &e.Description, &e.Location, &e.StartTime, &e.EndTime, &e.AllDay, &e.IsShared, &e.SyncedAt, &e.CreatedAt, &e.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return e, err
+}
+
+// GetCalendarEventByCalDAVUID returns a calendar event by CalDAV UID
+func (s *Storage) GetCalendarEventByCalDAVUID(uid string) (*domain.CalendarEvent, error) {
+	e := &domain.CalendarEvent{}
+	err := s.db.QueryRow(
+		`SELECT id, user_id, caldav_uid, title, description, location, start_time, end_time, all_day, is_shared, synced_at, created_at, updated_at
+		 FROM calendar_events WHERE caldav_uid = ?`,
+		uid,
+	).Scan(&e.ID, &e.UserID, &e.CalDAVUID, &e.Title, &e.Description, &e.Location, &e.StartTime, &e.EndTime, &e.AllDay, &e.IsShared, &e.SyncedAt, &e.CreatedAt, &e.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return e, err
+}
+
+// UpdateCalendarEvent updates an existing calendar event
+func (s *Storage) UpdateCalendarEvent(e *domain.CalendarEvent) error {
+	e.UpdatedAt = time.Now()
+	_, err := s.db.Exec(
+		`UPDATE calendar_events SET title = ?, description = ?, location = ?, start_time = ?, end_time = ?, all_day = ?, is_shared = ?, synced_at = ?, updated_at = ?
+		 WHERE id = ?`,
+		e.Title, e.Description, e.Location, e.StartTime, e.EndTime, e.AllDay, e.IsShared, e.SyncedAt, e.UpdatedAt, e.ID,
+	)
+	return err
+}
+
+// DeleteCalendarEvent deletes a calendar event by ID
+func (s *Storage) DeleteCalendarEvent(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM calendar_events WHERE id = ?`, id)
+	return err
+}
+
+// DeleteCalendarEventByCalDAVUID deletes a calendar event by CalDAV UID
+func (s *Storage) DeleteCalendarEventByCalDAVUID(uid string) error {
+	_, err := s.db.Exec(`DELETE FROM calendar_events WHERE caldav_uid = ?`, uid)
+	return err
+}
+
+// ListCalendarEvents returns calendar events in a time range
+func (s *Storage) ListCalendarEvents(userID int64, from, to time.Time, includeShared bool) ([]*domain.CalendarEvent, error) {
+	query := `SELECT id, user_id, caldav_uid, title, description, location, start_time, end_time, all_day, is_shared, synced_at, created_at, updated_at
+		FROM calendar_events
+		WHERE start_time >= ? AND start_time < ?`
+	if includeShared {
+		query += ` AND (user_id = ? OR is_shared = 1)`
+	} else {
+		query += ` AND user_id = ?`
+	}
+	query += ` ORDER BY start_time ASC`
+
+	rows, err := s.db.Query(query, from, to, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []*domain.CalendarEvent
+	for rows.Next() {
+		e := &domain.CalendarEvent{}
+		if err := rows.Scan(&e.ID, &e.UserID, &e.CalDAVUID, &e.Title, &e.Description, &e.Location, &e.StartTime, &e.EndTime, &e.AllDay, &e.IsShared, &e.SyncedAt, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	return events, nil
+}
+
+// ListCalendarEventsToday returns today's calendar events
+func (s *Storage) ListCalendarEventsToday(userID int64, includeShared bool) ([]*domain.CalendarEvent, error) {
+	today := time.Now().Truncate(24 * time.Hour)
+	tomorrow := today.Add(24 * time.Hour)
+	return s.ListCalendarEvents(userID, today, tomorrow, includeShared)
+}
+
+// ListCalendarEventsWeek returns this week's calendar events
+func (s *Storage) ListCalendarEventsWeek(userID int64, includeShared bool) ([]*domain.CalendarEvent, error) {
+	today := time.Now().Truncate(24 * time.Hour)
+	weekLater := today.Add(7 * 24 * time.Hour)
+	return s.ListCalendarEvents(userID, today, weekLater, includeShared)
+}
+
+// ListAllCalendarEvents returns all calendar events (for sync purposes)
+func (s *Storage) ListAllCalendarEvents() ([]*domain.CalendarEvent, error) {
+	rows, err := s.db.Query(
+		`SELECT id, user_id, caldav_uid, title, description, location, start_time, end_time, all_day, is_shared, synced_at, created_at, updated_at
+		 FROM calendar_events ORDER BY start_time ASC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []*domain.CalendarEvent
+	for rows.Next() {
+		e := &domain.CalendarEvent{}
+		if err := rows.Scan(&e.ID, &e.UserID, &e.CalDAVUID, &e.Title, &e.Description, &e.Location, &e.StartTime, &e.EndTime, &e.AllDay, &e.IsShared, &e.SyncedAt, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	return events, nil
+}
+
+// ListUpcomingCalendarEventsForReminder returns events starting within the next N minutes
+func (s *Storage) ListUpcomingCalendarEventsForReminder(minutes int) ([]*domain.CalendarEvent, error) {
+	now := time.Now()
+	threshold := now.Add(time.Duration(minutes) * time.Minute)
+
+	rows, err := s.db.Query(
+		`SELECT id, user_id, caldav_uid, title, description, location, start_time, end_time, all_day, is_shared, synced_at, created_at, updated_at
+		 FROM calendar_events
+		 WHERE start_time > ? AND start_time <= ? AND all_day = 0
+		 ORDER BY start_time ASC`,
+		now, threshold,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []*domain.CalendarEvent
+	for rows.Next() {
+		e := &domain.CalendarEvent{}
+		if err := rows.Scan(&e.ID, &e.UserID, &e.CalDAVUID, &e.Title, &e.Description, &e.Location, &e.StartTime, &e.EndTime, &e.AllDay, &e.IsShared, &e.SyncedAt, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, e)
+	}
+	return events, nil
 }

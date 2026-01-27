@@ -11,3 +11,8 @@ data:
   TIMEZONE: {{ .Values.config.timezone | quote }}
   MORNING_TIME: {{ .Values.config.morningTime | quote }}
   EVENING_TIME: {{ .Values.config.eveningTime | quote }}
+  DEBT_MANAGER_URL: {{ .Values.config.debtManagerURL | quote }}
+  CALDAV_URL: {{ .Values.config.caldavURL | quote }}
+  {{- if .Values.config.caldavCalendarID }}
+  CALDAV_CALENDAR_ID: {{ .Values.config.caldavCalendarID | quote }}
+  {{- end }}

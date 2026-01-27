@@ -7,6 +7,22 @@ import (
 	"github.com/tazhate/familybot/internal/domain"
 )
 
+// Persistent reply keyboard (always visible at bottom)
+func persistentMenuKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("📋 Задачи"),
+			tgbotapi.NewKeyboardButton("📅 Сегодня"),
+			tgbotapi.NewKeyboardButton("➕ Добавить"),
+		),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("🗓 Расписание"),
+			tgbotapi.NewKeyboardButton("📆 Календарь"),
+			tgbotapi.NewKeyboardButton("📱 Меню"),
+		),
+	)
+}
+
 // People keyboard
 func peopleKeyboard(persons []*domain.Person) tgbotapi.InlineKeyboardMarkup {
 	var rows [][]tgbotapi.InlineKeyboardButton
@@ -39,13 +55,13 @@ func peopleKeyboard(persons []*domain.Person) tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(rows...)
 }
 
-// Priority selection keyboard
-func priorityKeyboard(taskTitle string) tgbotapi.InlineKeyboardMarkup {
+// Priority selection keyboard (text stored in bot.pendingTasks)
+func priorityKeyboard() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔴 Срочно", "setpri:urgent:"+taskTitle),
-			tgbotapi.NewInlineKeyboardButtonData("🟡 На неделе", "setpri:week:"+taskTitle),
-			tgbotapi.NewInlineKeyboardButtonData("🟢 Когда-нибудь", "setpri:someday:"+taskTitle),
+			tgbotapi.NewInlineKeyboardButtonData("🔴 Срочно", "setpri:urgent"),
+			tgbotapi.NewInlineKeyboardButtonData("🟡 На неделе", "setpri:week"),
+			tgbotapi.NewInlineKeyboardButtonData("🟢 Когда-нибудь", "setpri:someday"),
 		),
 	)
 }

@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/tazhate/familybot/config"
+	"github.com/tazhate/familybot/internal/clients/debtmanager"
 	"github.com/tazhate/familybot/internal/service"
 	"github.com/tazhate/familybot/internal/storage"
 )
@@ -22,10 +24,17 @@ type Bot struct {
 	scheduleService  *service.ScheduleService
 	autoService      *service.AutoService
 	checklistService *service.ChecklistService
+	calendarService  *service.CalendarService
+	todoistService   *service.TodoistService
+	debtClient       *debtmanager.Client
 	server           *http.Server
+
+	// Pending task text by chatID (for priority selection)
+	pendingTasks   map[int64]string
+	pendingTasksMu sync.RWMutex
 }
 
-func New(cfg *config.Config, storage *storage.Storage, taskSvc *service.TaskService, reminderSvc *service.ReminderService, personSvc *service.PersonService, scheduleSvc *service.ScheduleService, autoSvc *service.AutoService, checklistSvc *service.ChecklistService) (*Bot, error) {
+func New(cfg *config.Config, storage *storage.Storage, taskSvc *service.TaskService, reminderSvc *service.ReminderService, personSvc *service.PersonService, scheduleSvc *service.ScheduleService, autoSvc *service.AutoService, checklistSvc *service.ChecklistService, calendarSvc *service.CalendarService, todoistSvc *service.TodoistService, debtClient *debtmanager.Client) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
 	if err != nil {
 		return nil, fmt.Errorf("create bot api: %w", err)
@@ -43,6 +52,10 @@ func New(cfg *config.Config, storage *storage.Storage, taskSvc *service.TaskServ
 		scheduleService:  scheduleSvc,
 		autoService:      autoSvc,
 		checklistService: checklistSvc,
+		calendarService:  calendarSvc,
+		todoistService:   todoistSvc,
+		debtClient:       debtClient,
+		pendingTasks:     make(map[int64]string),
 	}
 
 	// Set bot commands (menu button)
@@ -57,6 +70,7 @@ func (b *Bot) setCommands() {
 		{Command: "list", Description: "📋 Список задач"},
 		{Command: "add", Description: "➕ Добавить задачу"},
 		{Command: "today", Description: "📅 Задачи на сегодня"},
+		{Command: "calendar", Description: "📆 Календарь"},
 		{Command: "week", Description: "🗓 Недельное расписание"},
 		{Command: "help", Description: "❓ Справка по командам"},
 	}
@@ -137,6 +151,7 @@ func (b *Bot) Stop(ctx context.Context) error {
 func (b *Bot) SendMessage(chatID int64, text string) error {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "HTML"
+	msg.ReplyMarkup = persistentMenuKeyboard()
 	_, err := b.api.Send(msg)
 	return err
 }
@@ -165,4 +180,22 @@ func (b *Bot) SendMessageWithSnooze(chatID int64, text string, taskID int64) err
 
 func (b *Bot) API() *tgbotapi.BotAPI {
 	return b.api
+}
+
+// SetPendingTask stores task text for priority selection
+func (b *Bot) SetPendingTask(chatID int64, text string) {
+	b.pendingTasksMu.Lock()
+	defer b.pendingTasksMu.Unlock()
+	b.pendingTasks[chatID] = text
+}
+
+// GetPendingTask retrieves and removes pending task text
+func (b *Bot) GetPendingTask(chatID int64) (string, bool) {
+	b.pendingTasksMu.Lock()
+	defer b.pendingTasksMu.Unlock()
+	text, ok := b.pendingTasks[chatID]
+	if ok {
+		delete(b.pendingTasks, chatID)
+	}
+	return text, ok
 }

@@ -24,6 +24,7 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) {
 	chatID := msg.Chat.ID
 
 	if !b.cfg.IsAllowedUser(userID) {
+		log.Printf("handleMessage: unauthorized access attempt from user %d", userID)
 		b.SendMessage(chatID, "⛔ Доступ запрещён")
 		return
 	}
@@ -49,9 +50,33 @@ func (b *Bot) handleMessage(msg *tgbotapi.Message) {
 		return
 	}
 
+	// Handle persistent menu button presses
+	switch text {
+	case "📋 Задачи":
+		b.cmdList(chatID, user, "")
+		return
+	case "📅 Сегодня":
+		b.cmdToday(chatID, user)
+		return
+	case "➕ Добавить":
+		b.cmdAdd(chatID, user, "")
+		return
+	case "🗓 Расписание":
+		b.cmdWeek(chatID, user, "")
+		return
+	case "📆 Календарь":
+		b.cmdCalendar(chatID, user)
+		return
+	case "📱 Меню":
+		b.cmdMenu(chatID, user)
+		return
+	}
+
 	// Добавление задачи текстом — показываем выбор приоритета
 	if user != nil {
-		kb := priorityKeyboard(text)
+		log.Printf("handleMessage: text task prompt for user %d: %q", user.ID, text)
+		b.SetPendingTask(chatID, text)
+		kb := priorityKeyboard()
 		b.SendMessageWithKeyboard(chatID, "Выбери приоритет для задачи:\n\n<b>"+text+"</b>", kb)
 	}
 }
@@ -103,16 +128,22 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 	}
 
 	data := callback.Data
+	log.Printf("handleCallback: user=%d data=%q", user.ID, data)
+
 	parts := strings.Split(data, ":")
 
 	switch parts[0] {
 	case "setpri":
-		// setpri:priority:taskTitle
-		if len(parts) < 3 {
+		// setpri:priority (title from pendingTasks)
+		if len(parts) < 2 {
 			return
 		}
 		priority := domain.Priority(parts[1])
-		title := strings.Join(parts[2:], ":")
+		title, ok := b.GetPendingTask(chatID)
+		if !ok || title == "" {
+			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ Текст задачи не найден, попробуй снова"))
+			return
+		}
 
 		// Парсим @упоминания
 		cleanText, mentions := b.taskService.ParseMentions(title)
@@ -130,9 +161,11 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 
 		task, err := b.taskService.CreateFull(user.ID, chatID, cleanText, priority, personID, dueDate)
 		if err != nil {
+			log.Printf("callback setpri: error creating task: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
 		}
+		log.Printf("callback setpri: created task %d", task.ID)
 
 		b.api.Request(tgbotapi.NewCallback(callback.ID, "✅ Задача создана!"))
 
@@ -152,8 +185,15 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		}
 		taskID := atoi(parts[1])
 		if err := b.taskService.MarkDone(taskID, user.ID, chatID); err != nil {
+			log.Printf("callback done: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
+		}
+		log.Printf("callback done: task %d done", taskID)
+
+		// Удаляем из Apple Calendar
+		if b.calendarService != nil {
+			_ = b.calendarService.DeleteTaskFromCalendar(taskID)
 		}
 		b.api.Request(tgbotapi.NewCallback(callback.ID, "✅ Выполнено!"))
 		b.refreshTaskList(chatID, msgID, user.ID)
@@ -164,8 +204,15 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		}
 		taskID := atoi(parts[1])
 		if err := b.taskService.MarkDone(taskID, user.ID, chatID); err != nil {
+			log.Printf("callback done_today: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
+		}
+		log.Printf("callback done_today: task %d done", taskID)
+
+		// Удаляем из Apple Calendar
+		if b.calendarService != nil {
+			_ = b.calendarService.DeleteTaskFromCalendar(taskID)
 		}
 		b.api.Request(tgbotapi.NewCallback(callback.ID, "✅ Выполнено!"))
 		b.showToday(chatID, msgID, user.ID)
@@ -196,8 +243,15 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		}
 		taskID := atoi(parts[1])
 		if err := b.taskService.Delete(taskID, user.ID, chatID); err != nil {
+			log.Printf("callback confirm_del: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
+		}
+		log.Printf("callback confirm_del: task %d deleted", taskID)
+
+		// Удаляем из Apple Calendar
+		if b.calendarService != nil {
+			_ = b.calendarService.DeleteTaskFromCalendar(taskID)
 		}
 		b.api.Request(tgbotapi.NewCallback(callback.ID, "🗑 Удалено!"))
 		b.refreshTaskList(chatID, msgID, user.ID)
@@ -208,9 +262,12 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		}
 		taskID := atoi(parts[1])
 		if err := b.taskService.SetShared(taskID, user.ID, chatID, true); err != nil {
+			log.Printf("callback share: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
 		}
+		log.Printf("callback share: task %d shared", taskID)
+
 		b.api.Request(tgbotapi.NewCallback(callback.ID, "👨‍👩‍👧 Задача стала общей!"))
 
 		task, _ := b.storage.GetTask(taskID)
@@ -257,9 +314,11 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		}
 
 		if err := b.taskService.Snooze(taskID, user.ID, chatID, duration); err != nil {
+			log.Printf("callback snooze: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
 		}
+		log.Printf("callback snooze: task %d snoozed for %s", taskID, durationStr)
 
 		b.api.Request(tgbotapi.NewCallback(callback.ID, responseText))
 
@@ -307,9 +366,11 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		priority := domain.Priority(parts[2])
 
 		if err := b.taskService.UpdatePriority(taskID, user.ID, chatID, priority); err != nil {
+			log.Printf("callback pri: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
 		}
+		log.Printf("callback pri: task %d priority set to %s", taskID, priority)
 
 		b.api.Request(tgbotapi.NewCallback(callback.ID, "✅ Приоритет: "+string(priority)))
 		b.refreshTaskList(chatID, msgID, user.ID)
@@ -344,8 +405,22 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		}
 
 		if err := b.taskService.UpdateDueDate(taskID, user.ID, chatID, dueDate); err != nil {
+			log.Printf("callback date: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
+		}
+		log.Printf("callback date: task %d due date updated to %v", taskID, value)
+
+		// Синхронизация с Apple Calendar
+		if b.calendarService != nil {
+			if dueDate != nil {
+				task, _ := b.taskService.Get(taskID)
+				if task != nil {
+					_ = b.calendarService.SyncTaskToCalendar(task)
+				}
+			} else {
+				_ = b.calendarService.DeleteTaskFromCalendar(taskID)
+			}
 		}
 
 		b.api.Request(tgbotapi.NewCallback(callback.ID, responseText))
@@ -455,9 +530,11 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		dayOfWeek := domain.Weekday(atoi(parts[2]))
 
 		if err := b.scheduleService.ConfirmFloatingDay(eventID, user.ID, dayOfWeek); err != nil {
+			log.Printf("callback confirm_float: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
 		}
+		log.Printf("callback confirm_float: event %d confirmed for day %d", eventID, dayOfWeek)
 
 		b.api.Request(tgbotapi.NewCallback(callback.ID, "✅ "+domain.WeekdayName(dayOfWeek)))
 		b.showWeekSchedule(chatID, msgID, user.ID)
@@ -550,9 +627,11 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		}
 		personID := atoi(parts[1])
 		if err := b.personService.Delete(personID, user.ID); err != nil {
+			log.Printf("callback confirm_del_person: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
 		}
+		log.Printf("callback confirm_del_person: person %d deleted", personID)
 		b.api.Request(tgbotapi.NewCallback(callback.ID, "🗑 Удалено!"))
 		b.showPeople(chatID, msgID, user.ID)
 
@@ -606,6 +685,7 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		itemIndex := int(atoi(parts[2]))
 
 		if err := b.checklistService.CheckItem(checklistID, user.ID, itemIndex); err != nil {
+			log.Printf("callback cl_check: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
 		}
@@ -621,9 +701,11 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		checklistID := atoi(parts[1])
 
 		if err := b.checklistService.Reset(checklistID, user.ID); err != nil {
+			log.Printf("callback cl_reset: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
 		}
+		log.Printf("callback cl_reset: checklist %d reset", checklistID)
 
 		b.api.Request(tgbotapi.NewCallback(callback.ID, "🔄 Сброшено"))
 		b.showChecklist(chatID, msgID, checklistID)
@@ -662,9 +744,11 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 		checklistID := atoi(parts[1])
 
 		if err := b.checklistService.Delete(checklistID, user.ID); err != nil {
+			log.Printf("callback cl_confirm_del: error: %v", err)
 			b.api.Request(tgbotapi.NewCallback(callback.ID, "❌ "+err.Error()))
 			return
 		}
+		log.Printf("callback cl_confirm_del: checklist %d deleted", checklistID)
 
 		b.api.Request(tgbotapi.NewCallback(callback.ID, "🗑 Удалено"))
 		b.showChecklists(chatID, msgID, user.ID)
@@ -992,7 +1076,8 @@ func (b *Bot) showStats(chatID int64, msgID int, userID int64) {
 
 	weekCompleted, weekCreated, _ := b.storage.GetTaskStats(userID, weekAgo)
 	monthCompleted, monthCreated, _ := b.storage.GetTaskStats(userID, monthAgo)
-	pendingCount, _ := b.storage.GetPendingTaskCount(userID)
+
+pendingCount, _ := b.storage.GetPendingTaskCount(userID)
 
 	text := "<b>📊 Статистика задач</b>\n\n"
 	text += fmt.Sprintf("<b>За неделю:</b>\n")

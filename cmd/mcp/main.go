@@ -103,27 +103,37 @@ type AuthCode struct {
 	RedirectURI   string
 	CodeChallenge string
 	Scope         string
+	Role          UserRole
 	ExpiresAt     time.Time
 }
+
+type UserRole string
+
+const (
+	RoleOwner   UserRole = "owner"
+	RolePartner UserRole = "partner"
+)
 
 type AccessToken struct {
 	Token     string
 	ClientID  string
 	Scope     string
+	Role      UserRole
 	ExpiresAt time.Time
 }
 
 // MCP Server
 type MCPServer struct {
-	apiURL       string
-	apiUsername  string
-	apiPassword  string
-	mcpTokens    []string // Valid tokens (comma-separated in env, used as client_secret)
-	clientID     string   // OAuth client ID
-	baseURL      string   // Server's base URL for OAuth
-	authCodes    map[string]*AuthCode
-	accessTokens map[string]*AccessToken
-	mu           sync.RWMutex
+	apiURL        string
+	apiUsername   string
+	apiPassword   string
+	mcpTokens     []string // Owner tokens (comma-separated in env)
+	partnerTokens []string // Partner tokens (comma-separated in env)
+	clientID      string   // OAuth client ID
+	baseURL       string   // Server's base URL for OAuth
+	authCodes     map[string]*AuthCode
+	accessTokens  map[string]*AccessToken
+	mu            sync.RWMutex
 }
 
 func NewMCPServer() *MCPServer {
@@ -142,7 +152,7 @@ func NewMCPServer() *MCPServer {
 		clientID = "familybot"
 	}
 
-	// Parse comma-separated tokens
+	// Parse comma-separated owner tokens
 	var tokens []string
 	tokenStr := os.Getenv("FAMILYBOT_MCP_TOKEN")
 	if tokenStr != "" {
@@ -154,14 +164,27 @@ func NewMCPServer() *MCPServer {
 		}
 	}
 
+	// Parse comma-separated partner tokens
+	var partnerTokens []string
+	partnerTokenStr := os.Getenv("FAMILYBOT_MCP_TOKEN_PARTNER")
+	if partnerTokenStr != "" {
+		for _, t := range strings.Split(partnerTokenStr, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				partnerTokens = append(partnerTokens, t)
+			}
+		}
+	}
+
 	return &MCPServer{
-		apiURL:       apiURL,
-		apiUsername:  os.Getenv("FAMILYBOT_API_USERNAME"),
-		apiPassword:  os.Getenv("FAMILYBOT_API_PASSWORD"),
-		mcpTokens:    tokens,
-		clientID:     clientID,
-		baseURL:      baseURL,
-		authCodes:    make(map[string]*AuthCode),
+		apiURL:        apiURL,
+		apiUsername:   os.Getenv("FAMILYBOT_API_USERNAME"),
+		apiPassword:   os.Getenv("FAMILYBOT_API_PASSWORD"),
+		mcpTokens:     tokens,
+		partnerTokens: partnerTokens,
+		clientID:      clientID,
+		baseURL:       baseURL,
+		authCodes:     make(map[string]*AuthCode),
 		accessTokens: make(map[string]*AccessToken),
 	}
 }
@@ -199,15 +222,25 @@ func (s *MCPServer) RunStdio() {
 
 // RunHTTP runs the server in HTTP mode (for mobile Claude)
 func (s *MCPServer) RunHTTP(addr string) {
-	// OAuth 2.1 endpoints
+	// OAuth 2.1 endpoints (owner - default)
 	http.HandleFunc("/.well-known/oauth-protected-resource", s.handleProtectedResourceMetadata)
 	http.HandleFunc("/.well-known/oauth-authorization-server", s.handleAuthServerMetadata)
 	http.HandleFunc("/authorize", s.handleAuthorize)
 	http.HandleFunc("/token", s.handleToken)
 
-	// MCP endpoints
+	// MCP endpoints (owner)
 	http.HandleFunc("/mcp", s.handleHTTP)
 	http.HandleFunc("/mcp/sse", s.handleSSE)
+
+	// Partner OAuth 2.1 endpoints
+	http.HandleFunc("/partner/.well-known/oauth-protected-resource", s.handlePartnerProtectedResourceMetadata)
+	http.HandleFunc("/partner/.well-known/oauth-authorization-server", s.handlePartnerAuthServerMetadata)
+	http.HandleFunc("/partner/authorize", s.handleAuthorize) // Same handler, detects role from path
+	http.HandleFunc("/partner/token", s.handleToken)         // Same handler
+
+	// Partner MCP endpoints
+	http.HandleFunc("/partner/mcp", s.handleHTTP)
+	http.HandleFunc("/partner/mcp/sse", s.handleSSE)
 
 	// Health check
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -217,6 +250,7 @@ func (s *MCPServer) RunHTTP(addr string) {
 
 	log.Printf("MCP HTTP server starting on %s", addr)
 	log.Printf("OAuth endpoints enabled, base URL: %s", s.baseURL)
+	log.Printf("Partner endpoints: %s/partner/mcp", s.baseURL)
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("HTTP server error: %v", err)
 	}
@@ -255,6 +289,39 @@ func (s *MCPServer) handleAuthServerMetadata(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(metadata)
 }
 
+// Partner OAuth 2.1 Protected Resource Metadata
+func (s *MCPServer) handlePartnerProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	metadata := map[string]interface{}{
+		"resource":              s.baseURL + "/partner",
+		"authorization_servers": []string{s.baseURL + "/partner"},
+		"scopes_supported":      []string{"mcp"},
+	}
+
+	json.NewEncoder(w).Encode(metadata)
+}
+
+// Partner OAuth 2.1 Authorization Server Metadata
+func (s *MCPServer) handlePartnerAuthServerMetadata(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	metadata := map[string]interface{}{
+		"issuer":                                s.baseURL + "/partner",
+		"authorization_endpoint":                s.baseURL + "/partner/authorize",
+		"token_endpoint":                        s.baseURL + "/partner/token",
+		"response_types_supported":              []string{"code"},
+		"grant_types_supported":                 []string{"authorization_code"},
+		"code_challenge_methods_supported":      []string{"S256"},
+		"token_endpoint_auth_methods_supported": []string{"client_secret_post", "client_secret_basic"},
+		"scopes_supported":                      []string{"mcp"},
+	}
+
+	json.NewEncoder(w).Encode(metadata)
+}
+
 // OAuth 2.1 Authorization Endpoint
 func (s *MCPServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	log.Printf("OAuth /authorize request: %s %s", r.Method, r.URL.String())
@@ -269,6 +336,12 @@ func (s *MCPServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Detect role from path (partner endpoints start with /partner/)
+	role := RoleOwner
+	if strings.HasPrefix(r.URL.Path, "/partner/") {
+		role = RolePartner
+	}
+
 	// Parse parameters
 	clientID := r.URL.Query().Get("client_id")
 	redirectURI := r.URL.Query().Get("redirect_uri")
@@ -278,8 +351,8 @@ func (s *MCPServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	codeChallenge := r.URL.Query().Get("code_challenge")
 	codeChallengeMethod := r.URL.Query().Get("code_challenge_method")
 
-	log.Printf("OAuth authorize params: client_id=%s, redirect_uri=%s, response_type=%s, scope=%s, code_challenge_method=%s",
-		clientID, redirectURI, responseType, scope, codeChallengeMethod)
+	log.Printf("OAuth authorize params: client_id=%s, redirect_uri=%s, response_type=%s, scope=%s, code_challenge_method=%s, role=%s",
+		clientID, redirectURI, responseType, scope, codeChallengeMethod, role)
 
 	// Validate required parameters
 	if responseType != "code" {
@@ -308,11 +381,12 @@ func (s *MCPServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		RedirectURI:   redirectURI,
 		CodeChallenge: codeChallenge,
 		Scope:         scope,
+		Role:          role,
 		ExpiresAt:     time.Now().Add(10 * time.Minute),
 	}
 	s.mu.Unlock()
 
-	log.Printf("OAuth: Generated auth code for client %s", clientID)
+	log.Printf("OAuth: Generated auth code for client %s (role: %s)", clientID, role)
 
 	// Redirect back with code
 	redirectURL, err := url.Parse(redirectURI)
@@ -457,11 +531,12 @@ func (s *MCPServer) handleToken(w http.ResponseWriter, r *http.Request) {
 		Token:     accessToken,
 		ClientID:  clientID,
 		Scope:     authCode.Scope,
+		Role:      authCode.Role,
 		ExpiresAt: time.Now().Add(24 * time.Hour),
 	}
 	s.mu.Unlock()
 
-	log.Printf("OAuth: Issued access token for client %s", clientID)
+	log.Printf("OAuth: Issued access token for client %s (role: %s)", clientID, authCode.Role)
 
 	// Return token response
 	w.Header().Set("Content-Type", "application/json")
@@ -542,7 +617,8 @@ func (s *MCPServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check authentication
-	if !s.checkAuth(r) {
+	authed, role := s.checkAuth(r)
+	if !authed {
 		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata="%s/.well-known/oauth-protected-resource"`, s.baseURL))
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
@@ -562,7 +638,7 @@ func (s *MCPServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := s.handleRequest(req)
+	response := s.handleRequestWithRole(req, role)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
@@ -581,11 +657,13 @@ func (s *MCPServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check authentication
-	if !s.checkAuth(r) {
+	authed, role := s.checkAuth(r)
+	if !authed {
 		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer resource_metadata="%s/.well-known/oauth-protected-resource"`, s.baseURL))
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	_ = role // TODO: pass role to handleRequest when SSE supports it
 
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -633,14 +711,15 @@ func (s *MCPServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 }
 
 // checkAuth verifies Bearer token (OAuth access token or legacy token)
-func (s *MCPServer) checkAuth(r *http.Request) bool {
+// Returns (authorized, role) - role depends on token type
+func (s *MCPServer) checkAuth(r *http.Request) (bool, UserRole) {
 	auth := r.Header.Get("Authorization")
 	if auth == "" {
-		// If no auth configured, allow access
-		if len(s.mcpTokens) == 0 {
-			return true
+		// If no auth configured, allow access as owner
+		if len(s.mcpTokens) == 0 && len(s.partnerTokens) == 0 {
+			return true, RoleOwner
 		}
-		return false
+		return false, ""
 	}
 
 	// Check Bearer token
@@ -653,30 +732,41 @@ func (s *MCPServer) checkAuth(r *http.Request) bool {
 		s.mu.RUnlock()
 
 		if exists && time.Now().Before(accessToken.ExpiresAt) {
-			return true
+			return true, accessToken.Role
 		}
 
-		// Fall back to legacy simple token check
+		// Check legacy owner tokens
 		for _, validToken := range s.mcpTokens {
 			if token == validToken {
-				return true
+				return true, RoleOwner
+			}
+		}
+
+		// Check legacy partner tokens
+		for _, validToken := range s.partnerTokens {
+			if token == validToken {
+				return true, RolePartner
 			}
 		}
 	}
 
-	return false
+	return false, ""
 }
 
 func (s *MCPServer) handleRequest(req JSONRPCRequest) JSONRPCResponse {
+	return s.handleRequestWithRole(req, RoleOwner)
+}
+
+func (s *MCPServer) handleRequestWithRole(req JSONRPCRequest, role UserRole) JSONRPCResponse {
 	switch req.Method {
 	case "initialize":
-		return s.handleInitialize(req)
+		return s.handleInitializeWithRole(req, role)
 	case "initialized":
 		return JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: nil}
 	case "tools/list":
-		return s.handleToolsList(req)
+		return s.handleToolsListWithRole(req, role)
 	case "tools/call":
-		return s.handleToolsCall(req)
+		return s.handleToolsCallWithRole(req, role)
 	default:
 		return JSONRPCResponse{
 			JSONRPC: "2.0",
@@ -687,20 +777,39 @@ func (s *MCPServer) handleRequest(req JSONRPCRequest) JSONRPCResponse {
 }
 
 func (s *MCPServer) handleInitialize(req JSONRPCRequest) JSONRPCResponse {
+	return s.handleInitializeWithRole(req, RoleOwner)
+}
+
+func (s *MCPServer) handleInitializeWithRole(req JSONRPCRequest, role UserRole) JSONRPCResponse {
+	serverName := "familybot-mcp"
+	if role == RolePartner {
+		serverName = "familybot-mcp (Ира)"
+	}
+
 	result := InitializeResult{
 		ProtocolVersion: "2024-11-05",
 		Capabilities: map[string]interface{}{
 			"tools": map[string]interface{}{},
 		},
 	}
-	result.ServerInfo.Name = "familybot-mcp"
+	result.ServerInfo.Name = serverName
 	result.ServerInfo.Version = "1.0.0"
 
 	return JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
 }
 
 func (s *MCPServer) handleToolsList(req JSONRPCRequest) JSONRPCResponse {
-	tools := []Tool{
+	return s.handleToolsListWithRole(req, RoleOwner)
+}
+
+// partnerRestrictedTools - tools that partner cannot use (currently none - partner can do everything through their own endpoints)
+var partnerRestrictedTools = map[string]bool{
+	// Partner CAN create/delete tasks - they just use /api/partner/ endpoints
+	// which only allow them to manage their own tasks + shared tasks
+}
+
+func (s *MCPServer) handleToolsListWithRole(req JSONRPCRequest, role UserRole) JSONRPCResponse {
+	allTools := []Tool{
 		{
 			Name:        "familybot_list_tasks",
 			Description: "Получить список активных задач. Возвращает все незавершённые задачи с их приоритетами и датами.",
@@ -767,16 +876,202 @@ func (s *MCPServer) handleToolsList(req JSONRPCRequest) JSONRPCResponse {
 			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
 		},
 		{
+			Name:        "familybot_schedule_create",
+			Description: "Создать событие в расписании (addweekly). Событие будет повторяться каждую неделю в указанный день.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"day":       {Type: "string", Description: "День недели (Пн, Вт, Ср, Чт, Пт, Сб, Вс)"},
+					"time":      {Type: "string", Description: "Время (10:00 или 10:00-12:00 для диапазона)"},
+					"title":     {Type: "string", Description: "Название события"},
+					"reminder":  {Type: "string", Description: "За сколько минут напомнить (опционально, напр. 30)"},
+					"trackable": {Type: "string", Description: "Создавать задачу каждый день (true/false, опционально)"},
+				},
+				Required: []string{"day", "time", "title"},
+			},
+		},
+		{
+			Name:        "familybot_schedule_edit",
+			Description: "Редактировать событие расписания (editweekly). Можно изменить название, день, время, отслеживание.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"event_id":  {Type: "string", Description: "ID события (число)"},
+					"title":     {Type: "string", Description: "Новое название (опционально)"},
+					"day":       {Type: "string", Description: "Новый день недели (Пн, Вт, Ср... опционально)"},
+					"time":      {Type: "string", Description: "Новое время (10:00 или 10:00-12:00, опционально)"},
+					"trackable": {Type: "string", Description: "Отслеживать (true/false, опционально)"},
+					"shared":    {Type: "string", Description: "Общее событие (true/false, опционально)"},
+				},
+				Required: []string{"event_id"},
+			},
+		},
+		{
+			Name:        "familybot_schedule_delete",
+			Description: "Удалить событие из расписания (delweekly).",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"event_id": {Type: "string", Description: "ID события (число)"},
+				},
+				Required: []string{"event_id"},
+			},
+		},
+		{
 			Name:        "familybot_shared_tasks",
 			Description: "Получить общие семейные задачи.",
 			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
 		},
+		// Calendar tools
+		{
+			Name:        "familybot_calendar_today",
+			Description: "Получить события календаря на сегодня и завтра.",
+			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
+		},
+		{
+			Name:        "familybot_calendar_week",
+			Description: "Получить события календаря на неделю.",
+			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
+		},
+		{
+			Name:        "familybot_calendar_create",
+			Description: "Создать событие в календаре. Синхронизируется с Apple Calendar.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"title":      {Type: "string", Description: "Название события"},
+					"start_time": {Type: "string", Description: "Дата и время начала (YYYY-MM-DD или YYYY-MM-DD HH:MM)"},
+					"end_time":   {Type: "string", Description: "Дата и время окончания (опционально)"},
+					"location":   {Type: "string", Description: "Место (опционально)"},
+					"all_day":    {Type: "string", Description: "Событие на весь день (true/false, по умолчанию true если время не указано)"},
+				},
+				Required: []string{"title", "start_time"},
+			},
+		},
+		{
+			Name:        "familybot_calendar_sync",
+			Description: "Синхронизировать календарь с Apple Calendar.",
+			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
+		},
+		// Todoist tools
+		{
+			Name:        "familybot_todoist_sync",
+			Description: "Синхронизировать задачи с Todoist (двусторонняя синхронизация).",
+			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
+		},
+		{
+			Name:        "familybot_todoist_projects",
+			Description: "Получить список проектов Todoist.",
+			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
+		},
+		{
+			Name:        "familybot_todoist_sections",
+			Description: "Получить список разделов (sections) проекта Todoist.",
+			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
+		},
+		{
+			Name:        "familybot_checklists",
+			Description: "Получить список всех чек-листов.",
+			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
+		},
+		{
+			Name:        "familybot_checklist_get",
+			Description: "Получить чек-лист по ID.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"checklist_id": {Type: "string", Description: "ID чек-листа"},
+				},
+				Required: []string{"checklist_id"},
+			},
+		},
+		{
+			Name:        "familybot_checklist_create",
+			Description: "Создать новый чек-лист с пунктами.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"title": {Type: "string", Description: "Название чек-листа"},
+					"items": {Type: "array", Description: "Массив пунктов чек-листа (строки)"},
+				},
+				Required: []string{"title", "items"},
+			},
+		},
+		{
+			Name:        "familybot_checklist_delete",
+			Description: "Удалить чек-лист по ID.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"checklist_id": {Type: "string", Description: "ID чек-листа"},
+				},
+				Required: []string{"checklist_id"},
+			},
+		},
+		{
+			Name:        "familybot_create_person",
+			Description: "Создать нового человека (семья/ребёнок/контакт) с днём рождения.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"name":     {Type: "string", Description: "Имя человека"},
+					"role":     {Type: "string", Description: "Роль: child (ребёнок), family (семья), contact (контакт)"},
+					"birthday": {Type: "string", Description: "День рождения в формате YYYY-MM-DD (опционально)"},
+				},
+				Required: []string{"name"},
+			},
+		},
+		{
+			Name:        "familybot_task_share",
+			Description: "Сделать задачу общей (shared) для всей семьи.",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"task_id": {Type: "string", Description: "ID задачи"},
+				},
+				Required: []string{"task_id"},
+			},
+		},
+		{
+			Name:        "familybot_task_unshare",
+			Description: "Убрать задачу из общих (сделать личной).",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"task_id": {Type: "string", Description: "ID задачи"},
+				},
+				Required: []string{"task_id"},
+			},
+		},
+		{
+			Name:        "familybot_tasks_history",
+			Description: "Получить историю выполненных задач (последние 50).",
+			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
+		},
+		{
+			Name:        "familybot_tasks_stats",
+			Description: "Получить статистику задач (активные, выполненные за неделю/месяц).",
+			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
+		},
+	}
+
+	// Filter tools based on role
+	var tools []Tool
+	for _, t := range allTools {
+		if role == RolePartner && partnerRestrictedTools[t.Name] {
+			continue // Skip restricted tools for partner
+		}
+		tools = append(tools, t)
 	}
 
 	return JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: ToolsListResult{Tools: tools}}
 }
 
 func (s *MCPServer) handleToolsCall(req JSONRPCRequest) JSONRPCResponse {
+	return s.handleToolsCallWithRole(req, RoleOwner)
+}
+
+func (s *MCPServer) handleToolsCallWithRole(req JSONRPCRequest, role UserRole) JSONRPCResponse {
 	var params ToolCallParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return JSONRPCResponse{
@@ -786,32 +1081,131 @@ func (s *MCPServer) handleToolsCall(req JSONRPCRequest) JSONRPCResponse {
 		}
 	}
 
+	// Check if partner is trying to use restricted tool
+	if role == RolePartner && partnerRestrictedTools[params.Name] {
+		return JSONRPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result: ToolCallResult{
+				Content: []ContentBlock{{Type: "text", Text: "Нет прав на выполнение этой операции"}},
+				IsError: true,
+			},
+		}
+	}
+
 	var result string
 	var isError bool
 
+	// Use partner endpoints for partner role (their own tasks + shared)
+	// Use owner endpoints for owner role (all owner's tasks)
+	apiPrefix := "/api"
+	if role == RolePartner {
+		apiPrefix = "/api/partner"
+	}
+
 	switch params.Name {
 	case "familybot_list_tasks":
-		result, isError = s.apiGet("/api/tasks")
+		result, isError = s.apiGet(apiPrefix + "/tasks")
 	case "familybot_list_tasks_today":
-		result, isError = s.apiGet("/api/tasks/today")
+		result, isError = s.apiGet(apiPrefix + "/tasks/today")
 	case "familybot_create_task":
-		result, isError = s.apiPost("/api/tasks", params.Arguments)
+		result, isError = s.apiPost(apiPrefix+"/tasks", params.Arguments)
 	case "familybot_complete_task":
 		taskID := fmt.Sprintf("%v", params.Arguments["task_id"])
-		result, isError = s.apiPost("/api/task/"+taskID+"/done", nil)
+		result, isError = s.apiPost(apiPrefix+"/task/"+taskID+"/done", nil)
 	case "familybot_delete_task":
 		taskID := fmt.Sprintf("%v", params.Arguments["task_id"])
-		result, isError = s.apiDelete("/api/task/" + taskID)
+		result, isError = s.apiDelete(apiPrefix + "/task/" + taskID)
 	case "familybot_list_people":
-		result, isError = s.apiGet("/api/people")
+		result, isError = s.apiGet("/api/people") // Same for both
 	case "familybot_list_birthdays":
-		result, isError = s.apiGet("/api/birthdays")
+		result, isError = s.apiGet("/api/birthdays") // Same for both
 	case "familybot_list_reminders":
-		result, isError = s.apiGet("/api/reminders")
+		result, isError = s.apiGet("/api/reminders") // Same for both
 	case "familybot_week_schedule":
-		result, isError = s.apiGet("/api/week")
+		result, isError = s.apiGet("/api/schedule") // Full schedule with all fields
+	case "familybot_schedule_create":
+		body := map[string]interface{}{
+			"day":   params.Arguments["day"],
+			"time":  params.Arguments["time"],
+			"title": params.Arguments["title"],
+		}
+		if reminder, ok := params.Arguments["reminder"]; ok && reminder != "" {
+			body["reminder"] = reminder
+		}
+		if trackable, ok := params.Arguments["trackable"]; ok && trackable != "" {
+			body["trackable"] = trackable == "true" || trackable == "да"
+		}
+		result, isError = s.apiPost("/api/schedule", body)
+	case "familybot_schedule_edit":
+		eventID := fmt.Sprintf("%v", params.Arguments["event_id"])
+		body := make(map[string]interface{})
+		if title, ok := params.Arguments["title"]; ok && title != "" {
+			body["title"] = title
+		}
+		if day, ok := params.Arguments["day"]; ok && day != "" {
+			body["day"] = day
+		}
+		if time, ok := params.Arguments["time"]; ok && time != "" {
+			body["time"] = time
+		}
+		if trackable, ok := params.Arguments["trackable"]; ok && trackable != "" {
+			body["trackable"] = trackable == "true" || trackable == "да"
+		}
+		if shared, ok := params.Arguments["shared"]; ok && shared != "" {
+			body["shared"] = shared == "true" || shared == "да"
+		}
+		result, isError = s.apiPut("/api/schedule/"+eventID, body)
+	case "familybot_schedule_delete":
+		eventID := fmt.Sprintf("%v", params.Arguments["event_id"])
+		result, isError = s.apiDelete("/api/schedule/" + eventID)
 	case "familybot_shared_tasks":
-		result, isError = s.apiGet("/api/tasks/shared")
+		result, isError = s.apiGet("/api/tasks/shared") // Same for both
+	// Calendar tools
+	case "familybot_calendar_today":
+		result, isError = s.apiGet("/api/calendar/today")
+	case "familybot_calendar_week":
+		result, isError = s.apiGet("/api/calendar/week")
+	case "familybot_calendar_create":
+		result, isError = s.apiPost("/api/calendar/events", params.Arguments)
+	case "familybot_calendar_sync":
+		result, isError = s.apiPost("/api/calendar/sync", nil)
+	// Todoist tools
+	case "familybot_todoist_sync":
+		result, isError = s.apiPost("/api/todoist/sync", nil)
+	case "familybot_todoist_projects":
+		result, isError = s.apiGet("/api/todoist/projects")
+	case "familybot_todoist_sections":
+		result, isError = s.apiGet("/api/todoist/sections")
+
+	// Checklists
+	case "familybot_checklists":
+		result, isError = s.apiGet(apiPrefix + "/checklists")
+	case "familybot_checklist_get":
+		checklistID := fmt.Sprintf("%v", params.Arguments["checklist_id"])
+		result, isError = s.apiGet(apiPrefix + "/checklist/" + checklistID)
+	case "familybot_checklist_create":
+		result, isError = s.apiPost(apiPrefix+"/checklists", params.Arguments)
+	case "familybot_checklist_delete":
+		checklistID := fmt.Sprintf("%v", params.Arguments["checklist_id"])
+		result, isError = s.apiDelete(apiPrefix + "/checklist/" + checklistID)
+
+	// People
+	case "familybot_create_person":
+		result, isError = s.apiPost(apiPrefix+"/people", params.Arguments)
+
+	// Task operations
+	case "familybot_task_share":
+		taskID := fmt.Sprintf("%v", params.Arguments["task_id"])
+		result, isError = s.apiPost(apiPrefix+"/task/"+taskID+"/share", nil)
+	case "familybot_task_unshare":
+		taskID := fmt.Sprintf("%v", params.Arguments["task_id"])
+		result, isError = s.apiPost(apiPrefix+"/task/"+taskID+"/unshare", nil)
+	case "familybot_tasks_history":
+		result, isError = s.apiGet(apiPrefix + "/tasks/history")
+	case "familybot_tasks_stats":
+		result, isError = s.apiGet(apiPrefix + "/tasks/stats")
+
 	default:
 		result = "Unknown tool: " + params.Name
 		isError = true
@@ -837,6 +1231,10 @@ func (s *MCPServer) apiPost(path string, body interface{}) (string, bool) {
 
 func (s *MCPServer) apiDelete(path string) (string, bool) {
 	return s.apiRequest("DELETE", path, nil)
+}
+
+func (s *MCPServer) apiPut(path string, body interface{}) (string, bool) {
+	return s.apiRequest("PUT", path, body)
 }
 
 func (s *MCPServer) apiRequest(method, path string, body interface{}) (string, bool) {

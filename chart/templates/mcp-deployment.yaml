@@ -48,6 +48,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "familybot.fullname" . }}
                   key: mcp-token
+            {{- if .Values.secrets.mcpTokenPartner }}
+            - name: FAMILYBOT_MCP_TOKEN_PARTNER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: mcp-token-partner
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health

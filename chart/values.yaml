@@ -32,9 +32,31 @@ config:
   webhookURL: "https://family.tazhate.com"
   serverPort: "8080"
   dbPath: "/data/familybot.db"
-  timezone: "Europe/Lisbon"
+  timezone: "Europe/Moscow"
   morningTime: "09:00"
   eveningTime: "21:00"
+  debtManagerURL: "https://debts.tazhate.com/api"
+  # Apple Calendar (CalDAV)
+  caldavURL: "https://caldav.icloud.com"
+  caldavCalendarID: "/597484576/calendars/E29E8FEB-8377-4E17-A0D8-98851777D00F/"  # Home calendar
+
+# Secrets (configure via separate values file or --set):
+# secrets:
+#   telegramBotToken: "..."
+#   ownerTelegramId: 123456
+#   partnerTelegramId: 789012
+#   groupChatId: -1001234567890  # Optional: Group chat for daily quotes (use /chatid command to get ID)
+#   apiUsername: "..."
+#   apiPassword: "..."
+#   mcpToken: "..."
+#   mcpTokenPartner: "..."  # Optional: for partner OAuth access
+#   debtManagerToken: "..."  # Optional
+#   caldavUsername: "..."  # Optional
+#   caldavPassword: "..."  # Optional
+#   todoistToken: "..."  # Optional
+#   todoistProjectId: "..."  # Optional
+#   todoistSectionId: "..."  # Optional (owner's section)
+#   todoistPartnerSectionId: "..."  # Optional (partner's section)
 
 # MCP HTTP Server (for mobile Claude)
 mcp:

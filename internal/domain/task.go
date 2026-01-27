@@ -47,6 +47,9 @@ type Task struct {
 	RepeatType    RepeatType // Тип повторения
 	RepeatTime    string     // Время напоминания "HH:MM"
 	RepeatWeekNum int        // Номер недели месяца (1-4) для monthly_nth
+
+	// Todoist sync
+	TodoistID string // ID задачи в Todoist (для синхронизации)
 }
 
 func (t *Task) IsDone() bool {

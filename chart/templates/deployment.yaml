@@ -11,10 +11,12 @@ spec:
   selector:
     matchLabels:
       {{- include "familybot.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: bot
   template:
     metadata:
       labels:
         {{- include "familybot.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: bot
     spec:
       containers:
         - name: {{ .Chart.Name }}
@@ -39,6 +41,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "familybot.fullname" . }}
                   key: partner-telegram-id
+            {{- if .Values.secrets.groupChatId }}
+            - name: GROUP_CHAT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: group-chat-id
+            {{- end }}
             - name: API_USERNAME
               valueFrom:
                 secretKeyRef:
@@ -49,6 +58,55 @@ spec:
                 secretKeyRef:
                   name: {{ include "familybot.fullname" . }}
                   key: api-password
+            {{- if .Values.secrets.debtManagerToken }}
+            - name: DEBT_MANAGER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: debt-manager-token
+            {{- end }}
+            {{- if .Values.secrets.caldavUsername }}
+            - name: CALDAV_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: caldav-username
+            {{- end }}
+            {{- if .Values.secrets.caldavPassword }}
+            - name: CALDAV_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: caldav-password
+            {{- end }}
+            {{- if .Values.secrets.todoistToken }}
+            - name: TODOIST_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: todoist-token
+            {{- end }}
+            {{- if .Values.secrets.todoistProjectId }}
+            - name: TODOIST_PROJECT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: todoist-project-id
+            {{- end }}
+            {{- if .Values.secrets.todoistSectionId }}
+            - name: TODOIST_SECTION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: todoist-section-id
+            {{- end }}
+            {{- if .Values.secrets.todoistPartnerSectionId }}
+            - name: TODOIST_PARTNER_SECTION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "familybot.fullname" . }}
+                  key: todoist-partner-section-id
+            {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "familybot.fullname" . }}

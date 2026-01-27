@@ -9,6 +9,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 	"github.com/tazhate/familybot/config"
+	"github.com/tazhate/familybot/internal/clients/debtmanager"
 	"github.com/tazhate/familybot/internal/domain"
 	"github.com/tazhate/familybot/internal/service"
 	"github.com/tazhate/familybot/internal/storage"
@@ -20,29 +21,37 @@ type MessageSender interface {
 }
 
 type Scheduler struct {
-	cron            *cron.Cron
-	cfg             *config.Config
-	storage         *storage.Storage
-	taskService     *service.TaskService
-	reminderService *service.ReminderService
-	personService   *service.PersonService
-	scheduleService *service.ScheduleService
-	sender          MessageSender
+	cron             *cron.Cron
+	cfg              *config.Config
+	storage          *storage.Storage
+	taskService      *service.TaskService
+	reminderService  *service.ReminderService
+	personService    *service.PersonService
+	scheduleService  *service.ScheduleService
+	checklistService *service.ChecklistService
+	calendarService  *service.CalendarService
+	todoistService   *service.TodoistService
+	debtClient       *debtmanager.Client
+	sender           MessageSender
 }
 
-func New(cfg *config.Config, storage *storage.Storage, taskSvc *service.TaskService, reminderSvc *service.ReminderService, personSvc *service.PersonService, scheduleSvc *service.ScheduleService) *Scheduler {
+func New(cfg *config.Config, storage *storage.Storage, taskSvc *service.TaskService, reminderSvc *service.ReminderService, personSvc *service.PersonService, scheduleSvc *service.ScheduleService, checklistSvc *service.ChecklistService, calendarSvc *service.CalendarService, todoistSvc *service.TodoistService, debtClient *debtmanager.Client) *Scheduler {
 	location := cfg.Timezone
 
 	c := cron.New(cron.WithLocation(location))
 
 	return &Scheduler{
-		cron:            c,
-		cfg:             cfg,
-		storage:         storage,
-		taskService:     taskSvc,
-		reminderService: reminderSvc,
-		personService:   personSvc,
-		scheduleService: scheduleSvc,
+		cron:             c,
+		cfg:              cfg,
+		storage:          storage,
+		taskService:      taskSvc,
+		reminderService:  reminderSvc,
+		personService:    personSvc,
+		scheduleService:  scheduleSvc,
+		checklistService: checklistSvc,
+		calendarService:  calendarSvc,
+		todoistService:   todoistSvc,
+		debtClient:       debtClient,
 	}
 }
 
@@ -51,6 +60,11 @@ func (s *Scheduler) SetSender(sender MessageSender) {
 }
 
 func (s *Scheduler) Start(ctx context.Context) error {
+	// Создание задач из отслеживаемых событий расписания (за 5 мин до брифинга)
+	if _, err := s.cron.AddFunc("55 5 * * *", s.createTrackableEventTasks); err != nil {
+		return fmt.Errorf("add trackable event tasks: %w", err)
+	}
+
 	// Утренний брифинг (парсим "09:00" -> "0 9 * * *")
 	morningSpec := timeToCron(s.cfg.MorningTime)
 	if _, err := s.cron.AddFunc(morningSpec, s.morningBriefing); err != nil {
@@ -92,6 +106,44 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	if _, err := s.cron.AddFunc("* * * * *", s.checkTaskReminders); err != nil {
 		return fmt.Errorf("add task reminder check: %w", err)
 	}
+
+	// Apple Calendar: авто-синхронизация каждый час
+	if s.calendarService != nil && s.calendarService.IsConfigured() {
+		if _, err := s.cron.AddFunc("0 * * * *", s.syncAppleCalendar); err != nil {
+			return fmt.Errorf("add apple calendar sync: %w", err)
+		}
+		// Проверка напоминаний о календарных событиях каждые 5 минут
+		if _, err := s.cron.AddFunc("*/5 * * * *", s.checkCalendarEventReminders); err != nil {
+			return fmt.Errorf("add calendar event reminders: %w", err)
+		}
+		log.Println("Apple Calendar sync enabled (hourly)")
+	}
+
+	// Todoist: авто-синхронизация каждый час
+	if s.todoistService != nil && s.todoistService.IsConfigured() {
+		if _, err := s.cron.AddFunc("30 * * * *", s.syncTodoist); err != nil {
+			return fmt.Errorf("add todoist sync: %w", err)
+		}
+		log.Println("Todoist sync enabled (hourly)")
+	}
+
+	// Debt Manager: проверка платежей на завтра (вечером в 21:00)
+	if s.debtClient != nil && s.debtClient.IsConfigured() {
+		if _, err := s.cron.AddFunc("0 21 * * *", s.checkDebtPaymentsTomorrow); err != nil {
+			return fmt.Errorf("add debt payments tomorrow check: %w", err)
+		}
+		// Debt Manager: проверка зарплаты и сводка платежей (утром в 10:00)
+		if _, err := s.cron.AddFunc("0 10 * * *", s.checkPayday); err != nil {
+			return fmt.Errorf("add payday check: %w", err)
+		}
+		log.Println("Debt Manager notifications enabled")
+	}
+
+	// Daily relationship quote at 12:00 (inspired by Imago therapy)
+	if _, err := s.cron.AddFunc("0 12 * * *", s.sendDailyQuote); err != nil {
+		return fmt.Errorf("add daily quote: %w", err)
+	}
+	log.Println("Daily relationship quotes enabled (12:00)")
 
 	s.cron.Start()
 	log.Printf("Scheduler started (TZ: %s, morning: %s, evening: %s)",
@@ -136,6 +188,14 @@ func (s *Scheduler) sendBriefingTo(telegramID int64) {
 	birthdayText := s.checkBirthdays(user.ID)
 	if birthdayText != "" {
 		text += birthdayText + "\n"
+	}
+
+	// Добавляем события календаря на сегодня
+	if s.calendarService != nil {
+		calendarEvents, err := s.calendarService.ListToday(user.ID)
+		if err == nil && len(calendarEvents) > 0 {
+			text += s.calendarService.FormatTodayBriefing(calendarEvents) + "\n"
+		}
 	}
 
 	if len(tasks) == 0 {
@@ -337,6 +397,16 @@ func (s *Scheduler) checkEventReminders() {
 			text = fmt.Sprintf("⏰ <b>Через %d мин</b> — %s (%s)", e.ReminderBefore, e.Title, e.TimeStart)
 		default:
 			text = fmt.Sprintf("⏰ <b>Сейчас</b> — %s", e.Title)
+		}
+
+		// Append checklist if linked
+		if e.ChecklistID != nil && s.checklistService != nil {
+			checklist, err := s.checklistService.Get(*e.ChecklistID)
+			if err == nil && checklist != nil {
+				// Reset checklist before showing
+				checklist.ResetChecks()
+				text += "\n\n" + s.checklistService.FormatChecklist(checklist)
+			}
 		}
 
 		if err := s.sender.SendMessage(user.TelegramID, text); err != nil {
@@ -596,6 +666,378 @@ func (s *Scheduler) checkTaskReminders() {
 		if err := s.storage.MarkTaskReminderSent(r.ID); err != nil {
 			log.Printf("Error marking task reminder %d as sent: %v", r.ID, err)
 		}
+	}
+}
+
+// formatMoney formats a number with space as thousands separator (Russian style)
+func formatMoney(amount float64) string {
+	str := fmt.Sprintf("%.0f", amount)
+	n := len(str)
+	if n <= 3 {
+		return str
+	}
+	var result strings.Builder
+	remainder := n % 3
+	if remainder > 0 {
+		result.WriteString(str[:remainder])
+		if n > remainder {
+			result.WriteString(" ")
+		}
+	}
+	for i := remainder; i < n; i += 3 {
+		result.WriteString(str[i : i+3])
+		if i+3 < n {
+			result.WriteString(" ")
+		}
+	}
+	return result.String()
+}
+
+// checkDebtPaymentsTomorrow sends notifications about debt payments due tomorrow
+func (s *Scheduler) checkDebtPaymentsTomorrow() {
+	if s.sender == nil || s.debtClient == nil || !s.debtClient.IsConfigured() {
+		return
+	}
+
+	tomorrow := time.Now().In(s.cfg.Timezone).AddDate(0, 0, 1).Day()
+
+	debts, err := s.debtClient.GetDebtsForDay(tomorrow)
+	if err != nil {
+		log.Printf("Error getting debts for tomorrow: %v", err)
+		return
+	}
+
+	if len(debts) == 0 {
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("💳 <b>Платежи завтра:</b>\n\n")
+
+	for _, d := range debts {
+		emoji := debtmanager.CategoryEmoji(d.Category)
+		sb.WriteString(fmt.Sprintf("%s <b>%s</b>\n", emoji, d.Name))
+		sb.WriteString(fmt.Sprintf("   %s ₽\n\n", formatMoney(d.MonthlyPayment)))
+	}
+
+	sb.WriteString("/debts — все долги")
+
+	// Send only to owner (not partner)
+	if err := s.sender.SendMessage(s.cfg.OwnerTelegramID, sb.String()); err != nil {
+		log.Printf("Error sending debt payment reminder: %v", err)
+	}
+}
+
+// checkPayday checks if today is a payday and sends summary of upcoming payments
+func (s *Scheduler) checkPayday() {
+	if s.sender == nil || s.debtClient == nil || !s.debtClient.IsConfigured() {
+		return
+	}
+
+	today := time.Now().In(s.cfg.Timezone).Day()
+
+	isPayday, incomes, err := s.debtClient.IsPayday(today)
+	if err != nil {
+		log.Printf("Error checking payday: %v", err)
+		return
+	}
+
+	if !isPayday || len(incomes) == 0 {
+		return
+	}
+
+	// Get all debts for payment summary
+	debts, err := s.debtClient.GetDebts()
+	if err != nil {
+		log.Printf("Error getting debts for payday summary: %v", err)
+		return
+	}
+
+	if len(debts) == 0 {
+		return
+	}
+
+	var sb strings.Builder
+
+	// Income info
+	totalIncome := 0.0
+	for _, inc := range incomes {
+		totalIncome += inc.Amount
+	}
+	sb.WriteString(fmt.Sprintf("💰 <b>Зарплата!</b> %s ₽\n\n", formatMoney(totalIncome)))
+	sb.WriteString("<b>Что платим в этом месяце:</b>\n\n")
+
+	// List debts with payment days
+	totalPayments := 0.0
+	for _, d := range debts {
+		if d.CurrentAmount <= 0 {
+			continue
+		}
+		emoji := debtmanager.CategoryEmoji(d.Category)
+		sb.WriteString(fmt.Sprintf("%s %s: %s ₽ (%d числа)\n", emoji, d.Name, formatMoney(d.MonthlyPayment), d.PaymentDay))
+		totalPayments += d.MonthlyPayment
+	}
+
+	sb.WriteString(fmt.Sprintf("\n<b>Итого:</b> %s ₽\n", formatMoney(totalPayments)))
+	remaining := totalIncome - totalPayments
+	if remaining > 0 {
+		sb.WriteString(fmt.Sprintf("💵 Остаётся: %s ₽\n", formatMoney(remaining)))
+	} else if remaining < 0 {
+		sb.WriteString(fmt.Sprintf("⚠️ Не хватает: %s ₽\n", formatMoney(-remaining)))
+	}
+
+	sb.WriteString("\n/debts — подробнее")
+
+	// Send only to owner
+	if err := s.sender.SendMessage(s.cfg.OwnerTelegramID, sb.String()); err != nil {
+		log.Printf("Error sending payday summary: %v", err)
+	}
+}
+
+// ============== Apple Calendar ==============
+
+// syncAppleCalendar syncs events with Apple Calendar (runs hourly)
+func (s *Scheduler) syncAppleCalendar() {
+	if s.calendarService == nil || !s.calendarService.IsConfigured() {
+		return
+	}
+
+	// Sync FROM Apple (calendar events)
+	result, err := s.calendarService.SyncFromApple()
+	if err != nil {
+		log.Printf("Apple Calendar sync error: %v", err)
+		return
+	}
+
+	if result.Added > 0 || result.Updated > 0 || result.Deleted > 0 {
+		log.Printf("Apple Calendar sync from Apple: added=%d, updated=%d, deleted=%d",
+			result.Added, result.Updated, result.Deleted)
+	}
+
+	// Sync TO Apple (weekly schedule events)
+	if s.scheduleService != nil && s.storage != nil {
+		user, _ := s.storage.GetUserByTelegramID(s.cfg.OwnerTelegramID)
+		if user != nil {
+			events, err := s.scheduleService.List(user.ID, true)
+			if err == nil {
+				synced := 0
+				for _, e := range events {
+					var floatingDays []int
+					if e.IsFloating {
+						for _, d := range e.GetFloatingDays() {
+							floatingDays = append(floatingDays, int(d))
+						}
+					}
+					if err := s.calendarService.SyncWeeklyEventToCalendar(e.ID, int(e.DayOfWeek), e.TimeStart, e.TimeEnd, e.Title, e.IsFloating, floatingDays); err == nil {
+						synced++
+					}
+				}
+				if synced > 0 {
+					log.Printf("Apple Calendar sync to Apple: schedule=%d", synced)
+				}
+			}
+		}
+	}
+}
+
+// checkCalendarEventReminders sends reminders 30 minutes before calendar events
+func (s *Scheduler) checkCalendarEventReminders() {
+	if s.sender == nil || s.calendarService == nil {
+		return
+	}
+
+	// Get events starting in the next 30 minutes
+	events, err := s.calendarService.GetUpcomingForReminder(30)
+	if err != nil {
+		log.Printf("Error getting upcoming calendar events: %v", err)
+		return
+	}
+
+	for _, e := range events {
+		// Skip all-day events (no time reminder needed)
+		if e.AllDay {
+			continue
+		}
+
+		// Calculate minutes until event
+		minutesUntil := int(time.Until(e.StartTime).Minutes())
+
+		// Only send reminder once at ~30 minutes mark (between 28-32 minutes)
+		if minutesUntil < 28 || minutesUntil > 32 {
+			continue
+		}
+
+		// Get user for this event
+		user, err := s.storage.GetUserByID(e.UserID)
+		if err != nil || user == nil {
+			continue
+		}
+
+		// Format time in configured timezone
+		localTime := e.StartTime.In(s.cfg.Timezone).Format("15:04")
+
+		// Format reminder text
+		text := fmt.Sprintf("⏰ <b>Через 30 мин</b> — %s (%s)", e.Title, localTime)
+
+		if e.Location != "" {
+			text += fmt.Sprintf("\n📍 %s", e.Location)
+		}
+
+		// Send to owner
+		if err := s.sender.SendMessage(user.TelegramID, text); err != nil {
+			log.Printf("Error sending calendar reminder for event %d: %v", e.ID, err)
+		}
+
+		// Also send to partner if event is shared
+		if e.IsShared && s.cfg.PartnerTelegramID != 0 && s.cfg.PartnerTelegramID != user.TelegramID {
+			if err := s.sender.SendMessage(s.cfg.PartnerTelegramID, text); err != nil {
+				log.Printf("Error sending calendar reminder to partner for event %d: %v", e.ID, err)
+			}
+		}
+	}
+}
+
+// ============== Trackable Schedule Events ==============
+
+// createTrackableEventTasks creates tasks from trackable schedule events for today
+func (s *Scheduler) createTrackableEventTasks() {
+	if s.scheduleService == nil || s.taskService == nil || s.storage == nil {
+		return
+	}
+
+	s.createTrackableTasksForUser(s.cfg.OwnerTelegramID)
+	if s.cfg.PartnerTelegramID != 0 {
+		s.createTrackableTasksForUser(s.cfg.PartnerTelegramID)
+	}
+}
+
+func (s *Scheduler) createTrackableTasksForUser(telegramID int64) {
+	user, err := s.storage.GetUserByTelegramID(telegramID)
+	if err != nil || user == nil {
+		return
+	}
+
+	// Get trackable events for today
+	today := domain.Weekday(time.Now().In(s.cfg.Timezone).Weekday())
+	events, err := s.scheduleService.ListForDay(user.ID, today, false) // own events only
+	if err != nil {
+		log.Printf("Error getting schedule events for user %d: %v", user.ID, err)
+		return
+	}
+
+	todayDate := time.Now().In(s.cfg.Timezone)
+	todayStart := time.Date(todayDate.Year(), todayDate.Month(), todayDate.Day(), 0, 0, 0, 0, todayDate.Location())
+
+	for _, e := range events {
+		// Skip non-trackable events
+		if !e.IsTrackable {
+			continue
+		}
+
+		// Skip floating events not confirmed for today
+		if e.IsFloating {
+			if !e.IsConfirmedThisWeek() || e.ConfirmedDay == nil || domain.Weekday(*e.ConfirmedDay) != today {
+				continue
+			}
+		}
+
+		// Check if task already exists for this event today
+		// We use a naming convention: task title starts with event title
+		exists, err := s.storage.TaskExistsForEventToday(user.ID, e.Title, todayStart)
+		if err != nil {
+			log.Printf("Error checking task existence for event %d: %v", e.ID, err)
+			continue
+		}
+		if exists {
+			continue
+		}
+
+		// Create task from event
+		dueDate := todayStart
+		// If event has time, use that time for due date
+		if e.TimeStart != "" {
+			if t, err := parseTime(e.TimeStart); err == nil {
+				dueDate = time.Date(todayDate.Year(), todayDate.Month(), todayDate.Day(), t.Hour(), t.Minute(), 0, 0, todayDate.Location())
+			}
+		}
+
+		task := &domain.Task{
+			UserID:   user.ID,
+			Title:    e.Title,
+			Priority: "week", // Default priority
+			DueDate:  &dueDate,
+		}
+
+		if err := s.storage.CreateTask(task); err != nil {
+			log.Printf("Error creating task from event %d: %v", e.ID, err)
+			continue
+		}
+
+		log.Printf("Created task #%d from trackable event #%d: %s", task.ID, e.ID, task.Title)
+	}
+}
+
+// ============== Todoist ==============
+
+// syncTodoist syncs tasks with Todoist (runs hourly)
+func (s *Scheduler) syncTodoist() {
+	if s.todoistService == nil || !s.todoistService.IsConfigured() {
+		return
+	}
+
+	result, err := s.todoistService.Sync()
+	if err != nil {
+		log.Printf("Todoist sync error: %v", err)
+		return
+	}
+
+	if result.FromTodoist.Added > 0 || result.FromTodoist.Updated > 0 || result.FromTodoist.Deleted > 0 ||
+		result.ToTodoist.Added > 0 || result.ToTodoist.Updated > 0 {
+		log.Printf("Todoist sync: from_todoist(+%d, ~%d, -%d), to_todoist(+%d, ~%d)",
+			result.FromTodoist.Added, result.FromTodoist.Updated, result.FromTodoist.Deleted,
+			result.ToTodoist.Added, result.ToTodoist.Updated)
+	}
+
+	if len(result.Errors) > 0 {
+		log.Printf("Todoist sync errors: %d", len(result.Errors))
+	}
+}
+
+// ============== Daily Relationship Quotes ==============
+
+// sendDailyQuote sends a daily relationship quote inspired by Imago therapy
+func (s *Scheduler) sendDailyQuote() {
+	if s.sender == nil {
+		return
+	}
+
+	quote := domain.GetDailyQuote()
+
+	var message string
+	if quote.Author != "" {
+		message = fmt.Sprintf("💕 <b>Цитата дня о любви</b>\n\n<i>\"%s\"</i>\n\n— %s", quote.Text, quote.Author)
+	} else {
+		message = fmt.Sprintf("💕 <b>Цитата дня о любви</b>\n\n<i>\"%s\"</i>", quote.Text)
+	}
+
+	// Send to group chat if configured, otherwise send to individuals
+	if s.cfg.GroupChatID != 0 {
+		if err := s.sender.SendMessage(s.cfg.GroupChatID, message); err != nil {
+			log.Printf("Error sending daily quote to group chat: %v", err)
+		}
+		log.Printf("Daily quote sent to group: %s", quote.Text[:50])
+	} else {
+		// Fallback to individual messages
+		if err := s.sender.SendMessage(s.cfg.OwnerTelegramID, message); err != nil {
+			log.Printf("Error sending daily quote to owner: %v", err)
+		}
+
+		if s.cfg.PartnerTelegramID != 0 {
+			if err := s.sender.SendMessage(s.cfg.PartnerTelegramID, message); err != nil {
+				log.Printf("Error sending daily quote to partner: %v", err)
+			}
+		}
+		log.Printf("Daily quote sent to individuals: %s", quote.Text[:50])
 	}
 }
 

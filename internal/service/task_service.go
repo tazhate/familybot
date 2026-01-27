@@ -303,7 +303,7 @@ func (s *TaskService) LinkToPerson(taskID int64, userID int64, personID *int64) 
 }
 
 func (s *TaskService) List(userID int64, includeDone bool) ([]*domain.Task, error) {
-	return s.storage.ListTasksByUser(userID, true, includeDone)
+	return s.storage.ListTasksByUser(userID, false, includeDone)
 }
 
 // ListByChat returns tasks for a specific chat context

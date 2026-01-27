@@ -2,11 +2,13 @@ package bot
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/tazhate/familybot/internal/clients/debtmanager"
 	"github.com/tazhate/familybot/internal/domain"
 )
 
@@ -14,6 +16,8 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message, user *domain.User) {
 	chatID := msg.Chat.ID
 	cmd := msg.Command()
 	args := strings.TrimSpace(msg.CommandArguments())
+
+	log.Printf("handleCommand: cmd=%q, args=%q, text=%q", cmd, args, msg.Text)
 
 	switch cmd {
 	case "start":
@@ -46,6 +50,8 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message, user *domain.User) {
 		b.cmdAddWeekly(chatID, user, args)
 	case "delweekly":
 		b.cmdDelWeekly(chatID, user, args)
+	case "editweekly":
+		b.cmdEditWeekly(chatID, user, args)
 	case "addfloating":
 		b.cmdAddFloating(chatID, user, args)
 	case "floating":
@@ -102,6 +108,37 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message, user *domain.User) {
 		b.cmdShareWeekly(chatID, user, args)
 	case "unshareweekly":
 		b.cmdUnshareWeekly(chatID, user, args)
+	case "linkweeklychecklist":
+		b.cmdLinkWeeklyChecklist(chatID, user, args)
+	// Debt Manager commands
+	case "debts":
+		b.cmdDebts(chatID, user)
+	case "debt":
+		b.cmdDebt(chatID, user, args)
+	case "payday":
+		b.cmdPayday(chatID, user)
+	case "paid":
+		b.cmdPaid(chatID, user, args)
+	// Calendar commands
+	case "calendar":
+		b.cmdCalendar(chatID, user)
+	case "calweek":
+		b.cmdCalendarWeek(chatID, user)
+	case "addevent":
+		b.cmdAddEvent(chatID, user, args)
+	case "syncapple":
+		b.cmdSyncApple(chatID, user)
+	case "calendars":
+		b.cmdCalendars(chatID, user)
+	// Todoist commands
+	case "synctodoist":
+		b.cmdSyncTodoist(chatID, user)
+	case "todoist":
+		b.cmdTodoistProjects(chatID, user)
+	case "chatid":
+		b.cmdChatID(chatID, msg)
+	case "quote":
+		b.cmdQuote(chatID)
 	default:
 		b.SendMessage(chatID, "Неизвестная команда. /help для списка команд")
 	}
@@ -136,9 +173,11 @@ func (b *Bot) cmdStart(msg *tgbotapi.Message) {
 	}
 
 	if err := b.storage.CreateUser(newUser); err != nil {
+		log.Printf("cmdStart: error creating user: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка регистрации: "+err.Error())
 		return
 	}
+	log.Printf("cmdStart: registered user: %s (%d)", newUser.Name, newUser.TelegramID)
 
 	text := fmt.Sprintf("👋 Привет, %s!\n\nЯ помогу управлять задачами и напоминаниями.", name)
 	kb := mainMenuKeyboard()
@@ -274,7 +313,8 @@ func (b *Bot) cmdAdd(chatID int64, user *domain.User, args string) {
 
 	// Если приоритет не указан — показываем выбор
 	if priority == "" {
-		kb := priorityKeyboard(args)
+		b.SetPendingTask(chatID, args)
+		kb := priorityKeyboard()
 		hint := "Выбери приоритет:\n\n<b>" + args + "</b>"
 		if personName != "" {
 			hint += fmt.Sprintf("\n\n👤 Для: %s", personName)
@@ -288,13 +328,23 @@ func (b *Bot) cmdAdd(chatID int64, user *domain.User, args string) {
 
 	task, err := b.taskService.CreateFull(user.ID, chatID, args, priority, personID, dueDate)
 	if err != nil {
+		log.Printf("cmdAdd: error creating task: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdAdd: created task %d for user %d", task.ID, user.ID)
 
 	// Если есть связь с Telegram — назначаем пользователю
 	if assignedTo != nil {
 		_ = b.taskService.Assign(task.ID, *assignedTo, user.ID, chatID)
+	}
+
+	// Синхронизация с Apple Calendar если есть дата
+	if task.DueDate != nil && b.calendarService != nil {
+		if err := b.calendarService.SyncTaskToCalendar(task); err != nil {
+			// Log but don't fail
+			fmt.Printf("Warning: failed to sync task to calendar: %v\n", err)
+		}
 	}
 
 	text := fmt.Sprintf("✅ Задача добавлена\n\n%s <b>#%d</b> %s", task.PriorityEmoji(), task.ID, task.Title)
@@ -331,11 +381,12 @@ func (b *Bot) cmdList(chatID int64, user *domain.User, args string) {
 			return
 		}
 	} else {
-		// Показываем задачи текущего чата
-		tasks, err = b.taskService.ListByChat(chatID, false)
+		// Показываем задачи текущего пользователя
+		tasks, err = b.taskService.List(user.ID, false)
 	}
 
 	if err != nil {
+		log.Printf("cmdList: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -391,8 +442,15 @@ func (b *Bot) cmdDone(chatID int64, user *domain.User, args string) {
 	}
 
 	if err := b.taskService.MarkDone(taskID, user.ID, chatID); err != nil {
+		log.Printf("cmdDone: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
+	}
+	log.Printf("cmdDone: task %d done by user %d", taskID, user.ID)
+
+	// Удаляем из Apple Calendar
+	if b.calendarService != nil {
+		_ = b.calendarService.DeleteTaskFromCalendar(taskID)
 	}
 
 	text := "✅ Задача <b>#" + args + "</b> выполнена!"
@@ -429,9 +487,11 @@ func (b *Bot) cmdDel(chatID int64, user *domain.User, args string) {
 	}
 
 	if err := b.taskService.Delete(taskID, user.ID, chatID); err != nil {
+		log.Printf("cmdDel: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdDel: task %d deleted by user %d", taskID, user.ID)
 
 	text := fmt.Sprintf("🗑 Задача <b>#%d</b> удалена:\n<s>%s</s>", taskID, task.Title)
 	kb := tgbotapi.NewInlineKeyboardMarkup(
@@ -451,6 +511,7 @@ func (b *Bot) cmdToday(chatID int64, user *domain.User) {
 	// Показываем срочные задачи текущего чата
 	tasks, err := b.taskService.ListForTodayByChat(chatID)
 	if err != nil {
+		log.Printf("cmdToday: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -481,6 +542,7 @@ func (b *Bot) cmdReminders(chatID int64, user *domain.User) {
 
 	reminders, err := b.reminderService.List(user.ID)
 	if err != nil {
+		log.Printf("cmdReminders: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -503,6 +565,7 @@ func (b *Bot) cmdPeople(chatID int64, user *domain.User) {
 
 	persons, err := b.personService.List(user.ID)
 	if err != nil {
+		log.Printf("cmdPeople: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -547,9 +610,11 @@ func (b *Bot) cmdAddPerson(chatID int64, user *domain.User, args string) {
 
 	person, err := b.personService.Create(user.ID, name, role, birthday, "")
 	if err != nil {
+		log.Printf("cmdAddPerson: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdAddPerson: created person %s (ID: %d)", person.Name, person.ID)
 
 	text := fmt.Sprintf("✅ Добавлен: %s <b>%s</b>", person.RoleEmoji(), person.Name)
 	if person.HasBirthday() {
@@ -574,6 +639,7 @@ func (b *Bot) cmdBirthdays(chatID int64, user *domain.User) {
 	// Показываем ДР на ближайшие 60 дней
 	persons, err := b.personService.ListUpcomingBirthdays(user.ID, 60)
 	if err != nil {
+		log.Printf("cmdBirthdays: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -599,6 +665,7 @@ func (b *Bot) cmdWeek(chatID int64, user *domain.User, args string) {
 	// Include shared events so family members can see each other's schedule
 	events, err := b.scheduleService.List(user.ID, true)
 	if err != nil {
+		log.Printf("cmdWeek: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -648,8 +715,15 @@ func (b *Bot) cmdAddWeekly(chatID int64, user *domain.User, args string) {
 
 	event, err := b.scheduleService.Create(user.ID, dayOfWeek, timeStart, timeEnd, title, reminderBefore)
 	if err != nil {
+		log.Printf("cmdAddWeekly: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
+	}
+	log.Printf("cmdAddWeekly: created event %d", event.ID)
+
+	// Sync to Apple Calendar
+	if b.calendarService != nil {
+		_ = b.calendarService.SyncWeeklyEventToCalendar(event.ID, int(event.DayOfWeek), event.TimeStart, event.TimeEnd, event.Title, event.IsFloating, nil)
 	}
 
 	timeStr := event.TimeRange()
@@ -689,8 +763,15 @@ func (b *Bot) cmdDelWeekly(chatID int64, user *domain.User, args string) {
 	}
 
 	if err := b.scheduleService.Delete(eventID, user.ID); err != nil {
+		log.Printf("cmdDelWeekly: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
+	}
+	log.Printf("cmdDelWeekly: deleted event %d", eventID)
+
+	// Delete from Apple Calendar
+	if b.calendarService != nil {
+		_ = b.calendarService.DeleteWeeklyEventFromCalendar(eventID)
 	}
 
 	text := "✅ Событие удалено"
@@ -700,6 +781,136 @@ func (b *Bot) cmdDelWeekly(chatID int64, user *domain.User, args string) {
 		),
 	)
 	b.SendMessageWithKeyboard(chatID, text, kb)
+}
+
+func (b *Bot) cmdEditWeekly(chatID int64, user *domain.User, args string) {
+	if user == nil {
+		b.SendMessage(chatID, "Сначала /start")
+		return
+	}
+
+	if args == "" {
+		text := `<b>Редактировать событие:</b>
+
+/editweekly ID поле значение
+
+<b>Поля:</b>
+• <code>title</code> — название
+• <code>day</code> — день (Пн, Вт, Ср...)
+• <code>time</code> — время (10:00 или 10:00-12:00)
+• <code>track</code> — отслеживать (да/нет)
+
+<b>Примеры:</b>
+/editweekly 5 title Уборка квартиры
+/editweekly 5 day Сб
+/editweekly 5 time 10:00-12:00
+/editweekly 5 track да
+
+Показать ID: /week id`
+		b.SendMessage(chatID, text)
+		return
+	}
+
+	parts := strings.Fields(args)
+	if len(parts) < 3 {
+		b.SendMessage(chatID, "Формат: /editweekly ID поле значение")
+		return
+	}
+
+	eventID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		b.SendMessage(chatID, "Неверный ID события")
+		return
+	}
+
+	field := strings.ToLower(parts[1])
+	value := strings.Join(parts[2:], " ")
+
+	event, err := b.scheduleService.Get(eventID)
+	if err != nil || event == nil {
+		b.SendMessage(chatID, "❌ Событие не найдено")
+		return
+	}
+
+	// Helper to sync event to Apple after update
+	syncToApple := func() {
+		if b.calendarService != nil {
+			updated, _ := b.scheduleService.Get(eventID)
+			if updated != nil {
+				var floatingDays []int
+				if updated.IsFloating {
+					for _, d := range updated.GetFloatingDays() {
+						floatingDays = append(floatingDays, int(d))
+					}
+				}
+				_ = b.calendarService.SyncWeeklyEventToCalendar(updated.ID, int(updated.DayOfWeek), updated.TimeStart, updated.TimeEnd, updated.Title, updated.IsFloating, floatingDays)
+			}
+		}
+	}
+
+	switch field {
+	case "title", "название":
+		if err := b.scheduleService.UpdateTitle(eventID, user.ID, value); err != nil {
+			log.Printf("cmdEditWeekly: error updating title: %v", err)
+			b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+			return
+		}
+		syncToApple()
+		b.SendMessage(chatID, fmt.Sprintf("✅ Название изменено на: %s", value))
+
+	case "day", "день":
+		day, ok := domain.ParseWeekday(strings.ToLower(value))
+		if !ok {
+			b.SendMessage(chatID, "❌ Неверный день (Пн, Вт, Ср, Чт, Пт, Сб, Вс)")
+			return
+		}
+		if err := b.scheduleService.UpdateDay(eventID, user.ID, day); err != nil {
+			log.Printf("cmdEditWeekly: error updating day: %v", err)
+			b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+			return
+		}
+		syncToApple()
+		b.SendMessage(chatID, fmt.Sprintf("✅ День изменён на: %s", domain.WeekdayName(day)))
+
+	case "time", "время":
+		timeStart := value
+		timeEnd := ""
+		if strings.Contains(value, "-") {
+			timeParts := strings.Split(value, "-")
+			timeStart = timeParts[0]
+			if len(timeParts) > 1 {
+				timeEnd = timeParts[1]
+			}
+		}
+		if err := b.scheduleService.UpdateTime(eventID, user.ID, timeStart, timeEnd); err != nil {
+			log.Printf("cmdEditWeekly: error updating time: %v", err)
+			b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+			return
+		}
+		syncToApple()
+		if timeEnd != "" {
+			b.SendMessage(chatID, fmt.Sprintf("✅ Время изменено на: %s-%s", timeStart, timeEnd))
+		} else {
+			b.SendMessage(chatID, fmt.Sprintf("✅ Время изменено на: %s", timeStart))
+		}
+
+	case "track", "trackable", "отслеживать":
+		isTrackable := value == "да" || value == "yes" || value == "1" || value == "true" || value == "on"
+		if err := b.scheduleService.SetTrackable(eventID, user.ID, isTrackable); err != nil {
+			log.Printf("cmdEditWeekly: error updating trackable: %v", err)
+			b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+			return
+		}
+		// trackable doesn't affect Apple Calendar event
+		if isTrackable {
+			b.SendMessage(chatID, "✅ Событие теперь отслеживаемое (будет создавать задачу)")
+		} else {
+			b.SendMessage(chatID, "✅ Отслеживание выключено")
+		}
+
+	default:
+		b.SendMessage(chatID, "❌ Неизвестное поле: "+field+"\n\nДоступно: title, day, time, track")
+	}
 }
 
 func (b *Bot) cmdAddFloating(chatID int64, user *domain.User, args string) {
@@ -732,8 +943,19 @@ func (b *Bot) cmdAddFloating(chatID int64, user *domain.User, args string) {
 
 	event, err := b.scheduleService.CreateFloating(user.ID, days, timeStart, timeEnd, title)
 	if err != nil {
+		log.Printf("cmdAddFloating: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
+	}
+	log.Printf("cmdAddFloating: created event %d", event.ID)
+
+	// Sync to Apple Calendar
+	if b.calendarService != nil {
+		var floatingDays []int
+		for _, d := range days {
+			floatingDays = append(floatingDays, int(d))
+		}
+		_ = b.calendarService.SyncWeeklyEventToCalendar(event.ID, int(event.DayOfWeek), event.TimeStart, event.TimeEnd, event.Title, true, floatingDays)
 	}
 
 	var dayNames []string
@@ -758,6 +980,7 @@ func (b *Bot) cmdFloating(chatID int64, user *domain.User) {
 
 	events, err := b.scheduleService.ListFloating(user.ID)
 	if err != nil {
+		log.Printf("cmdFloating: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -870,6 +1093,7 @@ func (b *Bot) cmdSeedWeek(chatID int64, user *domain.User) {
 		b.SendMessage(chatID, "Расписание уже заполнено или произошла ошибка")
 		return
 	}
+	log.Printf("cmdSeedWeek: created %d events", created)
 
 	b.SendMessage(chatID, fmt.Sprintf("✅ Добавлено %d событий в расписание\n\n/week — посмотреть", created))
 }
@@ -916,6 +1140,7 @@ func (b *Bot) cmdSeedPeople(chatID int64, user *domain.User) {
 		b.SendMessage(chatID, "Люди уже добавлены или произошла ошибка")
 		return
 	}
+	log.Printf("cmdSeedPeople: created %d people", created)
 
 	b.SendMessage(chatID, fmt.Sprintf("✅ Добавлено %d человек\n\n/people — посмотреть\n/birthdays — дни рождения", created))
 }
@@ -999,10 +1224,12 @@ func (b *Bot) cmdAssign(chatID int64, user *domain.User, args string) {
 	// Обновляем AssignedTo (если есть связь с Telegram)
 	if assignToUserID != nil {
 		if err := b.taskService.Assign(taskID, *assignToUserID, user.ID, chatID); err != nil {
+			log.Printf("cmdAssign: error assigning task: %v", err)
 			b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 			return
 		}
 	}
+	log.Printf("cmdAssign: assigned task %d to %s", taskID, assignedName)
 
 	// Формируем ответ
 	var statusText string
@@ -1042,6 +1269,7 @@ func (b *Bot) cmdShared(chatID int64, user *domain.User) {
 
 	tasks, err := b.taskService.ListShared(false)
 	if err != nil {
+		log.Printf("cmdShared: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -1089,9 +1317,11 @@ func (b *Bot) cmdShare(chatID int64, user *domain.User, args string) {
 	}
 
 	if err := b.taskService.SetShared(taskID, user.ID, chatID, true); err != nil {
+		log.Printf("cmdShare: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdShare: task %d shared", taskID)
 
 	text := fmt.Sprintf("✅ Задача <b>#%d</b> теперь общая", taskID)
 	kb := tgbotapi.NewInlineKeyboardMarkup(
@@ -1121,9 +1351,11 @@ func (b *Bot) cmdUnshare(chatID int64, user *domain.User, args string) {
 	}
 
 	if err := b.taskService.SetShared(taskID, user.ID, chatID, false); err != nil {
+		log.Printf("cmdUnshare: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdUnshare: task %d unshared", taskID)
 
 	text := fmt.Sprintf("✅ Задача <b>#%d</b> больше не общая", taskID)
 	kb := tgbotapi.NewInlineKeyboardMarkup(
@@ -1283,6 +1515,7 @@ func (b *Bot) cmdEdit(chatID int64, user *domain.User, args string) {
 	switch field {
 	case "текст", "title", "название":
 		if err := b.taskService.UpdateTitle(taskID, user.ID, chatID, value); err != nil {
+			log.Printf("cmdEdit: error updating title: %v", err)
 			b.SendMessage(chatID, "❌ "+err.Error())
 			return
 		}
@@ -1302,6 +1535,7 @@ func (b *Bot) cmdEdit(chatID int64, user *domain.User, args string) {
 			return
 		}
 		if err := b.taskService.UpdatePriority(taskID, user.ID, chatID, priority); err != nil {
+			log.Printf("cmdEdit: error updating priority: %v", err)
 			b.SendMessage(chatID, "❌ "+err.Error())
 			return
 		}
@@ -1317,9 +1551,23 @@ func (b *Bot) cmdEdit(chatID int64, user *domain.User, args string) {
 			}
 		}
 		if err := b.taskService.UpdateDueDate(taskID, user.ID, chatID, dueDate); err != nil {
+			log.Printf("cmdEdit: error updating due date: %v", err)
 			b.SendMessage(chatID, "❌ "+err.Error())
 			return
 		}
+
+		// Синхронизация с Apple Calendar
+		if b.calendarService != nil {
+			if dueDate != nil {
+				task, _ := b.taskService.Get(taskID)
+				if task != nil {
+					_ = b.calendarService.SyncTaskToCalendar(task)
+				}
+			} else {
+				_ = b.calendarService.DeleteTaskFromCalendar(taskID)
+			}
+		}
+
 		dateStr := "убрана"
 		if dueDate != nil {
 			dateStr = dueDate.Format("02.01.2006")
@@ -1406,6 +1654,7 @@ func (b *Bot) cmdEditReminder(chatID int64, user *domain.User, args string) {
 	switch field {
 	case "текст", "title", "название":
 		if err := b.storage.UpdateReminderTitle(reminderID, value); err != nil {
+			log.Printf("cmdEditReminder: error updating title: %v", err)
 			b.SendMessage(chatID, "❌ "+err.Error())
 			return
 		}
@@ -1425,6 +1674,7 @@ func (b *Bot) cmdEditReminder(chatID int64, user *domain.User, args string) {
 		}
 		reminder.NextRun = &newNextRun
 		if err := b.storage.UpdateReminder(reminder); err != nil {
+			log.Printf("cmdEditReminder: error updating time: %v", err)
 			b.SendMessage(chatID, "❌ "+err.Error())
 			return
 		}
@@ -1443,6 +1693,7 @@ func (b *Bot) cmdAutos(chatID int64, user *domain.User) {
 
 	autos, err := b.autoService.List(user.ID)
 	if err != nil {
+		log.Printf("cmdAutos: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -1491,9 +1742,11 @@ func (b *Bot) cmdAddAuto(chatID int64, user *domain.User, args string) {
 
 	auto, err := b.autoService.Create(user.ID, name, year)
 	if err != nil {
+		log.Printf("cmdAddAuto: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdAddAuto: created auto %d", auto.ID)
 
 	yearStr := ""
 	if auto.Year > 0 {
@@ -1546,9 +1799,11 @@ func (b *Bot) cmdInsurance(chatID int64, user *domain.User, args string) {
 	}
 
 	if err := b.autoService.SetInsurance(autoID, user.ID, date); err != nil {
+		log.Printf("cmdInsurance: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdInsurance: set insurance for auto %d", autoID)
 
 	text := fmt.Sprintf("✅ Страховка установлена до %s", date.Format("02.01.2006"))
 	kb := tgbotapi.NewInlineKeyboardMarkup(
@@ -1596,9 +1851,11 @@ func (b *Bot) cmdMaintenance(chatID int64, user *domain.User, args string) {
 	}
 
 	if err := b.autoService.SetMaintenance(autoID, user.ID, date); err != nil {
+		log.Printf("cmdMaintenance: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdMaintenance: set maintenance for auto %d", autoID)
 
 	text := fmt.Sprintf("✅ ТО установлено до %s", date.Format("02.01.2006"))
 	kb := tgbotapi.NewInlineKeyboardMarkup(
@@ -1801,9 +2058,11 @@ func (b *Bot) cmdAddRepeat(chatID int64, user *domain.User, args string) {
 		weekNum,
 	)
 	if err != nil {
+		log.Printf("cmdAddRepeat: error: %v", err)
 		b.SendMessage(chatID, "❌ "+err.Error())
 		return
 	}
+	log.Printf("cmdAddRepeat: created repeating task %d", task.ID)
 
 	repeatNames := map[domain.RepeatType]string{
 		domain.RepeatDaily:      "ежедневно",
@@ -1883,6 +2142,7 @@ func (b *Bot) cmdChecklist(chatID int64, user *domain.User, args string) {
 
 	c, err := b.checklistService.GetByTitle(user.ID, args)
 	if err != nil {
+		log.Printf("cmdChecklist: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -1905,6 +2165,7 @@ func (b *Bot) cmdChecklists(chatID int64, user *domain.User) {
 
 	checklists, err := b.checklistService.List(user.ID)
 	if err != nil {
+		log.Printf("cmdChecklists: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -1964,9 +2225,11 @@ func (b *Bot) cmdAddChecklist(chatID int64, user *domain.User, args string) {
 
 	c, err := b.checklistService.Create(user.ID, title, items)
 	if err != nil {
+		log.Printf("cmdAddChecklist: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdAddChecklist: created checklist %d", c.ID)
 
 	text := fmt.Sprintf("✅ Чек-лист создан: <b>%s</b>\n\n%s", c.Title, b.checklistService.FormatChecklist(c))
 	kb := checklistKeyboard(c)
@@ -1998,9 +2261,11 @@ func (b *Bot) cmdDelChecklist(chatID int64, user *domain.User, args string) {
 	}
 
 	if err := b.checklistService.Delete(checklistID, user.ID); err != nil {
+		log.Printf("cmdDelChecklist: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdDelChecklist: deleted checklist %d", checklistID)
 
 	text := "✅ Чек-лист удалён"
 	kb := tgbotapi.NewInlineKeyboardMarkup(
@@ -2036,8 +2301,7 @@ func (b *Bot) cmdSeedChecklists(chatID int64, user *domain.User) {
 
 	created := 0
 	for _, cl := range checklists {
-		_, err := b.checklistService.Create(user.ID, cl.title, cl.items)
-		if err == nil {
+		if _, err := b.checklistService.Create(user.ID, cl.title, cl.items); err == nil {
 			created++
 		}
 	}
@@ -2055,6 +2319,7 @@ func (b *Bot) cmdHistory(chatID int64, user *domain.User) {
 
 	tasks, err := b.storage.ListCompletedTasks(user.ID, 20)
 	if err != nil {
+		log.Printf("cmdHistory: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
@@ -2095,7 +2360,8 @@ func (b *Bot) cmdStats(chatID int64, user *domain.User) {
 
 	weekCompleted, weekCreated, _ := b.storage.GetTaskStats(user.ID, weekAgo)
 	monthCompleted, monthCreated, _ := b.storage.GetTaskStats(user.ID, monthAgo)
-	pendingCount, _ := b.storage.GetPendingTaskCount(user.ID)
+
+pendingCount, _ := b.storage.GetPendingTaskCount(user.ID)
 
 	text := "<b>📊 Статистика задач</b>\n\n"
 	text += fmt.Sprintf("<b>За неделю:</b>\n")
@@ -2175,9 +2441,11 @@ func (b *Bot) cmdLinkPerson(chatID int64, user *domain.User, args string) {
 
 	// Связываем
 	if err := b.personService.LinkToTelegram(person.ID, telegramID); err != nil {
+		log.Printf("cmdLinkPerson: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdLinkPerson: linked person %d to telegram %d", person.ID, telegramID)
 
 	text := fmt.Sprintf("✅ <b>%s</b> связан с Telegram %s\n\nТеперь @%s в задачах будет назначать задачи этому пользователю",
 		person.Name, displayName, strings.ToLower(person.Name))
@@ -2215,9 +2483,11 @@ func (b *Bot) cmdShareWeekly(chatID int64, user *domain.User, args string) {
 	}
 
 	if err := b.scheduleService.SetShared(eventID, user.ID, true); err != nil {
+		log.Printf("cmdShareWeekly: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdShareWeekly: event %d shared", eventID)
 
 	text := fmt.Sprintf("✅ Событие <b>#%d</b> теперь видно всей семье 👨‍👩‍👧‍👦", eventID)
 	kb := tgbotapi.NewInlineKeyboardMarkup(
@@ -2247,9 +2517,11 @@ func (b *Bot) cmdUnshareWeekly(chatID int64, user *domain.User, args string) {
 	}
 
 	if err := b.scheduleService.SetShared(eventID, user.ID, false); err != nil {
+		log.Printf("cmdUnshareWeekly: error: %v", err)
 		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
 		return
 	}
+	log.Printf("cmdUnshareWeekly: event %d unshared", eventID)
 
 	text := fmt.Sprintf("✅ Событие <b>#%d</b> больше не общее", eventID)
 	kb := tgbotapi.NewInlineKeyboardMarkup(
@@ -2258,4 +2530,587 @@ func (b *Bot) cmdUnshareWeekly(chatID int64, user *domain.User, args string) {
 		),
 	)
 	b.SendMessageWithKeyboard(chatID, text, kb)
+}
+
+// cmdLinkWeeklyChecklist links a checklist to a weekly event
+func (b *Bot) cmdLinkWeeklyChecklist(chatID int64, user *domain.User, args string) {
+	if user == nil {
+		b.SendMessage(chatID, "Сначала /start")
+		return
+	}
+
+	if args == "" {
+		text := `<b>Привязать чек-лист к событию:</b>
+
+/linkweeklychecklist EventID ChecklistName
+
+При напоминании о событии будет показан чек-лист.
+
+<b>Пример:</b>
+/linkweeklychecklist 5 Тим
+
+💡 /week ids — показать ID событий
+💡 /checklists — список чек-листов`
+		b.SendMessage(chatID, text)
+		return
+	}
+
+	parts := strings.SplitN(args, " ", 2)
+	if len(parts) < 2 {
+		b.SendMessage(chatID, "Укажи: /linkweeklychecklist EventID ChecklistName")
+		return
+	}
+
+	eventID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		b.SendMessage(chatID, "Неверный ID события")
+		return
+	}
+
+	checklistName := strings.TrimSpace(parts[1])
+
+	// Get checklist by name
+	checklist, err := b.checklistService.GetByTitle(user.ID, checklistName)
+	if err != nil || checklist == nil {
+		b.SendMessage(chatID, "❌ Чек-лист не найден: "+checklistName+"\n\n💡 /checklists — список чек-листов")
+		return
+	}
+
+	// Link checklist to event
+	if err := b.scheduleService.LinkChecklist(eventID, user.ID, &checklist.ID); err != nil {
+		log.Printf("cmdLinkWeeklyChecklist: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+		return
+	}
+	log.Printf("cmdLinkWeeklyChecklist: linked checklist %d to event %d", checklist.ID, eventID)
+
+	// Get event for display
+	event, _ := b.scheduleService.Get(eventID)
+	eventTitle := fmt.Sprintf("#%d", eventID)
+	if event != nil {
+		eventTitle = event.Title
+	}
+
+	text := fmt.Sprintf("✅ Чек-лист <b>%s</b> привязан к событию <b>%s</b>\n\nПри напоминании о событии будет показан чек-лист.",
+		checklist.Title, eventTitle)
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📅 Расписание", "menu:week"),
+			tgbotapi.NewInlineKeyboardButtonData("📋 Чек-листы", "menu:checklists"),
+		),
+	)
+	b.SendMessageWithKeyboard(chatID, text, kb)
+}
+
+// ========== Debt Manager Commands ========== 
+
+// formatMoney formats a number with space as thousands separator (Russian style)
+func formatMoney(amount float64) string {
+	// Format with no decimals
+	str := fmt.Sprintf("%.0f", amount)
+
+	// Add space separators from right to left
+	n := len(str)
+	if n <= 3 {
+		return str
+	}
+
+	var result strings.Builder
+	remainder := n % 3
+	if remainder > 0 {
+		result.WriteString(str[:remainder])
+		if n > remainder {
+			result.WriteString(" ")
+		}
+	}
+	for i := remainder; i < n; i += 3 {
+		result.WriteString(str[i : i+3])
+		if i+3 < n {
+			result.WriteString(" ")
+		}
+	}
+	return result.String()
+}
+
+// cmdDebts shows list of all debts
+func (b *Bot) cmdDebts(chatID int64, user *domain.User) {
+	if b.debtClient == nil || !b.debtClient.IsConfigured() {
+		b.SendMessage(chatID, "❌ Debt Manager не настроен")
+		return
+	}
+
+	debts, err := b.debtClient.GetDebts()
+	if err != nil {
+		log.Printf("cmdDebts: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+		return
+	}
+
+	if len(debts) == 0 {
+		b.SendMessage(chatID, "🎉 Долгов нет!")
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("💳 <b>Долги:</b>\n\n")
+
+	totalDebt := 0.0
+	totalMonthly := 0.0
+
+	for _, d := range debts {
+		if d.CurrentAmount <= 0 {
+			continue
+		}
+		emoji := debtmanager.CategoryEmoji(d.Category)
+		sb.WriteString(fmt.Sprintf("%s <b>%s</b> (#%d)\n", emoji, d.Name, d.ID))
+		sb.WriteString(fmt.Sprintf("   Остаток: %s ₽\n", formatMoney(d.CurrentAmount)))
+		sb.WriteString(fmt.Sprintf("   Платёж: %s ₽ (%d числа)\n\n", formatMoney(d.MonthlyPayment), d.PaymentDay))
+		totalDebt += d.CurrentAmount
+		totalMonthly += d.MonthlyPayment
+	}
+
+	sb.WriteString(fmt.Sprintf("<b>Итого долг:</b> %s ₽\n", formatMoney(totalDebt)))
+	sb.WriteString(fmt.Sprintf("<b>Платежей в месяц:</b> %s ₽\n", formatMoney(totalMonthly)))
+
+	b.SendMessage(chatID, sb.String())
+}
+
+// cmdDebt shows details of a specific debt
+func (b *Bot) cmdDebt(chatID int64, user *domain.User, args string) {
+	if b.debtClient == nil || !b.debtClient.IsConfigured() {
+		b.SendMessage(chatID, "❌ Debt Manager не настроен")
+		return
+	}
+
+	if args == "" {
+		b.SendMessage(chatID, "Укажи ID долга: /debt 1\n\n💡 /debts — список всех долгов")
+		return
+	}
+
+	id, err := strconv.ParseUint(args, 10, 64)
+	if err != nil {
+		b.SendMessage(chatID, "Неверный ID")
+		return
+	}
+
+	debt, err := b.debtClient.GetDebt(uint(id))
+	if err != nil {
+		log.Printf("cmdDebt: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+		return
+	}
+
+	emoji := debtmanager.CategoryEmoji(debt.Category)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%s <b>%s</b>\n\n", emoji, debt.Name))
+	sb.WriteString(fmt.Sprintf("💰 Остаток: <b>%s ₽</b>\n", formatMoney(debt.CurrentAmount)))
+	sb.WriteString(fmt.Sprintf("📊 Было: %s ₽\n", formatMoney(debt.TotalAmount)))
+	sb.WriteString(fmt.Sprintf("💳 Платёж: %s ₽\n", formatMoney(debt.MonthlyPayment)))
+	sb.WriteString(fmt.Sprintf("📅 День платежа: %d\n", debt.PaymentDay))
+
+	if debt.InterestRate > 0 {
+		sb.WriteString(fmt.Sprintf("📈 Ставка: %.1f%%\n", debt.InterestRate))
+	}
+
+	if debt.Notes != "" {
+		sb.WriteString(fmt.Sprintf("\n📝 %s", debt.Notes))
+	}
+
+	// Calculate progress
+	if debt.TotalAmount > 0 {
+		progress := (debt.TotalAmount - debt.CurrentAmount) / debt.TotalAmount * 100
+		sb.WriteString(fmt.Sprintf("\n\n✅ Погашено: %.1f%%", progress))
+	}
+
+	b.SendMessage(chatID, sb.String())
+}
+
+// cmdPayday shows debts to pay today
+func (b *Bot) cmdPayday(chatID int64, user *domain.User) {
+	if b.debtClient == nil || !b.debtClient.IsConfigured() {
+		b.SendMessage(chatID, "❌ Debt Manager не настроен")
+		return
+	}
+
+	today := time.Now().In(b.cfg.Timezone).Day()
+
+	debts, err := b.debtClient.GetDebtsForDay(today)
+	if err != nil {
+		log.Printf("cmdPayday: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+		return
+	}
+
+	if len(debts) == 0 {
+		b.SendMessage(chatID, "✅ Сегодня платежей нет\n\n💡 /debts — все долги")
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("💳 <b>Платежи сегодня:</b>\n\n")
+
+	total := 0.0
+	for _, d := range debts {
+		emoji := debtmanager.CategoryEmoji(d.Category)
+		sb.WriteString(fmt.Sprintf("%s <b>%s</b>\n", emoji, d.Name))
+		sb.WriteString(fmt.Sprintf("   %s ₽\n\n", formatMoney(d.MonthlyPayment)))
+		total += d.MonthlyPayment
+	}
+
+	sb.WriteString(fmt.Sprintf("<b>Итого:</b> %s ₽", formatMoney(total)))
+
+	b.SendMessage(chatID, sb.String())
+}
+
+// cmdPaid marks a debt payment as made
+func (b *Bot) cmdPaid(chatID int64, user *domain.User, args string) {
+	if b.debtClient == nil || !b.debtClient.IsConfigured() {
+		b.SendMessage(chatID, "❌ Debt Manager не настроен")
+		return
+	}
+
+	if args == "" {
+		b.SendMessage(chatID, "Укажи ID долга: /paid 1\n\n💡 /debts — список всех долгов")
+		return
+	}
+
+	parts := strings.Fields(args)
+	id, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		b.SendMessage(chatID, "Неверный ID")
+		return
+	}
+
+	// Get debt to show confirmation
+	debt, err := b.debtClient.GetDebt(uint(id))
+	if err != nil {
+		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+		return
+	}
+
+	// Create payment
+	amount := debt.MonthlyPayment
+	if len(parts) > 1 {
+		if parsedAmount, err := strconv.ParseFloat(parts[1], 64); err == nil {
+			amount = parsedAmount
+		}
+	}
+
+	if err := b.debtClient.CreatePayment(uint(id), amount, time.Now()); err != nil {
+		log.Printf("cmdPaid: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка создания платежа: "+err.Error())
+		return
+	}
+	log.Printf("cmdPaid: paid %f for debt %d", amount, id)
+
+	text := fmt.Sprintf("✅ Платёж записан!\n\n%s <b>%s</b>\nСумма: %s ₽",
+		debtmanager.CategoryEmoji(debt.Category),
+		debt.Name,
+		formatMoney(amount))
+
+	b.SendMessage(chatID, text)
+}
+
+// === Calendar Commands === 
+
+// cmdCalendar shows today's and tomorrow's events
+func (b *Bot) cmdCalendar(chatID int64, user *domain.User) {
+	if b.calendarService == nil || !b.calendarService.IsConfigured() {
+		b.SendMessage(chatID, "📆 Календарь не настроен\n\nДля настройки нужно указать Apple ID и app-specific password в конфигурации.")
+		return
+	}
+
+	now := time.Now()
+	today := now.Truncate(24 * time.Hour)
+	dayAfterTomorrow := today.Add(48 * time.Hour)
+
+	events, err := b.calendarService.ListRange(user.ID, today, dayAfterTomorrow)
+	if err != nil {
+		log.Printf("cmdCalendar: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка загрузки событий: "+err.Error())
+		return
+	}
+
+	if len(events) == 0 {
+		b.SendMessage(chatID, "📆 На сегодня и завтра событий нет\n\n/calweek — на неделю\n/addevent — добавить")
+		return
+	}
+
+	text := b.calendarService.FormatEventList(events)
+	text += "\n/calweek — на неделю\n/addevent — добавить"
+
+	b.SendMessage(chatID, text)
+}
+
+// cmdCalendarWeek shows this week's events
+func (b *Bot) cmdCalendarWeek(chatID int64, user *domain.User) {
+	if b.calendarService == nil || !b.calendarService.IsConfigured() {
+		b.SendMessage(chatID, "📆 Календарь не настроен")
+		return
+	}
+
+	events, err := b.calendarService.ListWeek(user.ID)
+	if err != nil {
+		log.Printf("cmdCalendarWeek: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка загрузки событий: "+err.Error())
+		return
+	}
+
+	if len(events) == 0 {
+		b.SendMessage(chatID, "📆 На этой неделе событий нет\n\n/addevent — добавить")
+		return
+	}
+
+	text := "📆 <b>События на неделю:</b>\n\n"
+	text += b.calendarService.FormatEventList(events)
+	text += "\n/addevent — добавить"
+
+	b.SendMessage(chatID, text)
+}
+
+// cmdAddEvent adds a new calendar event
+// Format: /addevent <title> <date> [time]
+// Examples: /addevent Встреча 25.01, /addevent Созвон 25.01 14:00
+func (b *Bot) cmdAddEvent(chatID int64, user *domain.User, args string) {
+	if b.calendarService == nil {
+		b.SendMessage(chatID, "📆 Календарь не настроен")
+		return
+	}
+
+	if args == "" {
+		b.SendMessage(chatID, "Формат: /addevent <название> <дата> [время]\n\nПримеры:\n/addevent Встреча 25.01\n/addevent Созвон 25.01 14:00\n/addevent День рождения завтра")
+		return
+	}
+
+	// Parse date from args
+	cleanText, dueDate := b.taskService.ParseDate(args)
+	if dueDate == nil {
+		b.SendMessage(chatID, "Не удалось распознать дату. Примеры:\n/addevent Встреча 25.01\n/addevent Созвон завтра 14:00")
+		return
+	}
+
+	title := strings.TrimSpace(cleanText)
+	if title == "" {
+		b.SendMessage(chatID, "Укажите название события")
+		return
+	}
+
+	// Parse time if present (look for HH:MM pattern)
+	allDay := true
+	timeRe := strings.NewReplacer(".", ":")
+	for _, word := range strings.Fields(args) {
+		if len(word) == 5 && word[2] == ':' {
+			if h, err := strconv.Atoi(word[:2]); err == nil && h >= 0 && h <= 23 {
+				if m, err := strconv.Atoi(word[3:]); err == nil && m >= 0 && m <= 59 {
+					*dueDate = time.Date(dueDate.Year(), dueDate.Month(), dueDate.Day(), h, m, 0, 0, dueDate.Location())
+					allDay = false
+				title = strings.Replace(title, word, "", 1)
+				title = strings.TrimSpace(title)
+				}
+			}
+		}
+		// Also try HH.MM format
+		normalized := timeRe.Replace(word)
+		if normalized != word && len(normalized) == 5 && normalized[2] == ':' {
+			if h, err := strconv.Atoi(normalized[:2]); err == nil && h >= 0 && h <= 23 {
+				if m, err := strconv.Atoi(normalized[3:]); err == nil && m >= 0 && m <= 59 {
+					*dueDate = time.Date(dueDate.Year(), dueDate.Month(), dueDate.Day(), h, m, 0, 0, dueDate.Location())
+					allDay = false
+				title = strings.Replace(title, word, "", 1)
+				title = strings.TrimSpace(title)
+				}
+			}
+		}
+	}
+
+	// Calculate end time (1 hour after start for non-all-day events)
+	var endTime time.Time
+	if !allDay {
+		endTime = dueDate.Add(time.Hour)
+	}
+
+	event, err := b.calendarService.CreateEvent(user.ID, title, *dueDate, endTime, "", allDay)
+	if err != nil {
+		log.Printf("cmdAddEvent: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка создания события: "+err.Error())
+		return
+	}
+	log.Printf("cmdAddEvent: created event %s", event.ID)
+
+	text := fmt.Sprintf("✅ Событие создано:\n\n📆 %s\n%s", event.Title, event.FormatDateTime())
+	if event.CalDAVUID != "" {
+		text += "\n\n☁️ Синхронизировано с Apple Calendar"
+	}
+
+	b.SendMessage(chatID, text)
+}
+
+// cmdSyncApple triggers manual sync with Apple Calendar
+func (b *Bot) cmdSyncApple(chatID int64, user *domain.User) {
+	if b.calendarService == nil || !b.calendarService.IsConfigured() {
+		b.SendMessage(chatID, "📆 Apple Calendar не настроен\n\nДля настройки укажите CALDAV_USERNAME и CALDAV_PASSWORD")
+		return
+	}
+
+	b.SendMessage(chatID, "🔄 Синхронизация с Apple Calendar...")
+	log.Printf("cmdSyncApple: starting sync for user %d", user.ID)
+
+	// Sync calendar events FROM Apple
+	result, err := b.calendarService.SyncFromApple()
+	if err != nil {
+		log.Printf("cmdSyncApple: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка синхронизации событий: "+err.Error())
+		return
+	}
+	log.Printf("cmdSyncApple: synced events: added=%d, updated=%d, deleted=%d", result.Added, result.Updated, result.Deleted)
+
+	// Sync weekly schedule events TO Apple
+	scheduleSynced := 0
+	if b.scheduleService != nil {
+		events, err := b.scheduleService.List(user.ID, true)
+		if err == nil {
+			for _, e := range events {
+				var floatingDays []int
+				if e.IsFloating {
+					for _, d := range e.GetFloatingDays() {
+						floatingDays = append(floatingDays, int(d))
+					}
+				}
+				if err := b.calendarService.SyncWeeklyEventToCalendar(e.ID, int(e.DayOfWeek), e.TimeStart, e.TimeEnd, e.Title, e.IsFloating, floatingDays); err == nil {
+					scheduleSynced++
+				}
+			}
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString("✅ Синхронизация завершена!\n\n")
+	sb.WriteString("<b>📅 Из Apple:</b>\n")
+	sb.WriteString(fmt.Sprintf("  ➕ Добавлено: %d\n", result.Added))
+	sb.WriteString(fmt.Sprintf("  🔄 Обновлено: %d\n", result.Updated))
+	sb.WriteString(fmt.Sprintf("  🗑 Удалено: %d\n", result.Deleted))
+
+	if scheduleSynced > 0 {
+		sb.WriteString(fmt.Sprintf("\n<b>🗓 В Apple (расписание):</b>\n"))
+		sb.WriteString(fmt.Sprintf("  📤 Синхронизировано: %d\n", scheduleSynced))
+	}
+
+	if len(result.Errors) > 0 {
+		sb.WriteString(fmt.Sprintf("\n⚠️ Ошибок: %d", len(result.Errors)))
+	}
+
+	b.SendMessage(chatID, sb.String())
+}
+
+// cmdCalendars shows available calendars (for setup)
+func (b *Bot) cmdCalendars(chatID int64, user *domain.User) {
+	if b.calendarService == nil || !b.calendarService.IsConfigured() {
+		b.SendMessage(chatID, "📆 Apple Calendar не настроен")
+		return
+	}
+
+	b.SendMessage(chatID, "🔍 Поиск календарей...")
+
+	calendars, err := b.calendarService.DiscoverCalendars()
+	if err != nil {
+		log.Printf("cmdCalendars: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+		return
+	}
+
+	if len(calendars) == 0 {
+		b.SendMessage(chatID, "Календари не найдены")
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("📆 <b>Доступные календари:</b>\n\n")
+
+	for i, cal := range calendars {
+		sb.WriteString(fmt.Sprintf("%d. <b>%s</b>\n", i+1, cal.DisplayName))
+		sb.WriteString(fmt.Sprintf("   ID: <code>%s</code>\n\n", cal.ID))
+	}
+
+	sb.WriteString("Укажите CALDAV_CALENDAR_ID в конфигурации для синхронизации с конкретным календарём")
+
+	b.SendMessage(chatID, sb.String())
+}
+
+// ================== Todoist Commands ================== 
+
+// cmdSyncTodoist triggers manual sync with Todoist
+func (b *Bot) cmdSyncTodoist(chatID int64, user *domain.User) {
+	if b.todoistService == nil || !b.todoistService.IsConfigured() {
+		b.SendMessage(chatID, "📋 Todoist не настроен\n\nДля настройки укажите TODOIST_TOKEN")
+		return
+	}
+
+	b.SendMessage(chatID, "🔄 Синхронизация с Todoist...")
+
+	result, err := b.todoistService.Sync()
+	if err != nil {
+		log.Printf("cmdSyncTodoist: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка синхронизации: "+err.Error())
+		return
+	}
+	log.Printf("cmdSyncTodoist: sync complete")
+
+	b.SendMessage(chatID, b.todoistService.FormatSyncResult(result))
+}
+
+// cmdTodoistProjects shows available Todoist projects
+func (b *Bot) cmdTodoistProjects(chatID int64, user *domain.User) {
+	if b.todoistService == nil || !b.todoistService.IsConfigured() {
+		b.SendMessage(chatID, "📋 Todoist не настроен\n\nДля настройки укажите TODOIST_TOKEN")
+		return
+	}
+
+	projects, err := b.todoistService.GetProjects()
+	if err != nil {
+		log.Printf("cmdTodoistProjects: error: %v", err)
+		b.SendMessage(chatID, "❌ Ошибка: "+err.Error())
+		return
+	}
+
+	if len(projects) == 0 {
+		b.SendMessage(chatID, "Проекты не найдены")
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("📋 <b>Todoist проекты:</b>\n\n")
+
+	for i, p := range projects {
+		sb.WriteString(fmt.Sprintf("%d. <b>%s</b>\n", i+1, p.Name))
+		sb.WriteString(fmt.Sprintf("   ID: <code>%s</code>\n\n", p.ID))
+	}
+
+	sb.WriteString("Укажите TODOIST_PROJECT_ID в конфигурации для синхронизации с конкретным проектом")
+
+	b.SendMessage(chatID, sb.String())
+}
+
+// cmdChatID shows current chat ID (useful for finding group chat ID)
+func (b *Bot) cmdChatID(chatID int64, msg *tgbotapi.Message) {
+	var text string
+	if msg.Chat.Type == "private" {
+		text = fmt.Sprintf("📱 <b>Личный чат</b>\n\nChat ID: <code>%d</code>", chatID)
+	} else {
+		text = fmt.Sprintf("👥 <b>%s</b>\n\nChat ID: <code>%d</code>\nChat Type: %s",
+			msg.Chat.Title, chatID, msg.Chat.Type)
+	}
+	b.SendMessage(chatID, text)
+}
+
+// cmdQuote sends a daily relationship quote immediately
+func (b *Bot) cmdQuote(chatID int64) {
+	quote := domain.GetDailyQuote()
+	var message string
+	if quote.Author != "" {
+		message = fmt.Sprintf("💕 <b>Цитата дня о любви</b>\n\n<i>\"%s\"</i>\n\n— %s", quote.Text, quote.Author)
+	} else {
+		message = fmt.Sprintf("💕 <b>Цитата дня о любви</b>\n\n<i>\"%s\"</i>", quote.Text)
+	}
+	b.SendMessage(chatID, message)
 }

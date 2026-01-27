@@ -29,12 +29,14 @@ type WeeklyEvent struct {
 	TimeEnd        string  // "HH:MM" (optional)
 	Title          string
 	PersonID       *int64  // Optional link to person
+	ChecklistID    *int64  // Optional link to checklist (показывается при напоминании)
 	ReminderBefore int     // Minutes before to remind (0 = no reminder)
 	IsFloating     bool    // Плавающее событие (выбор дня на неделе)
 	FloatingDays   string  // Дни для плавающего события, напр "6,0" (Сб, Вс)
 	ConfirmedDay   *int    // Подтверждённый день на эту неделю (nil = не выбран)
 	ConfirmedWeek  int     // ISO неделя года когда был подтверждён день
 	IsShared       bool    // Общее событие (видно всей семье)
+	IsTrackable    bool    // Отслеживаемое — создаёт задачу которую можно отметить ✅
 	CreatedAt      time.Time
 }
 
