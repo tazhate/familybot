@@ -458,6 +458,8 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 			b.showFloating(chatID, msgID, user.ID)
 		case "shared":
 			b.showShared(chatID, msgID, user.ID)
+		case "partner":
+			b.showPartnerTasks(chatID, msgID, user.ID)
 		case "autos":
 			b.showAutos(chatID, msgID, user.ID)
 		case "checklists":
@@ -490,6 +492,8 @@ func (b *Bot) handleCallback(callback *tgbotapi.CallbackQuery) {
 			b.showToday(chatID, msgID, user.ID)
 		case "week":
 			b.showWeekSchedule(chatID, msgID, user.ID)
+		case "partner":
+			b.showPartnerTasks(chatID, msgID, user.ID)
 		}
 
 	case "add":
@@ -944,6 +948,38 @@ func (b *Bot) showShared(chatID int64, msgID int, userID int64) {
 	kb := tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("📋 Мои задачи", "menu:list"),
+		),
+	)
+
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	edit.ParseMode = "HTML"
+	edit.ReplyMarkup = &kb
+	b.api.Send(edit)
+}
+
+func (b *Bot) showPartnerTasks(chatID int64, msgID int, userID int64) {
+	partnerChatID := b.cfg.PartnerTelegramID
+	if partnerChatID == 0 {
+		edit := tgbotapi.NewEditMessageText(chatID, msgID, "Партнёр не настроен")
+		b.api.Send(edit)
+		return
+	}
+
+	tasks, _ := b.taskService.ListByChat(partnerChatID, false)
+
+	personNames, _ := b.personService.GetNamesMap(userID)
+
+	text := "<b>👩 Задачи Иры</b>\n\n"
+	if len(tasks) == 0 {
+		text += "Нет активных задач 🎉"
+	} else {
+		text += b.taskService.FormatTaskListWithPersons(tasks, personNames)
+	}
+
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📋 Мои задачи", "menu:list"),
+			tgbotapi.NewInlineKeyboardButtonData("🔄", "refresh:partner"),
 		),
 	)
 

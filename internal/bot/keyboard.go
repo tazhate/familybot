@@ -129,7 +129,8 @@ func taskListKeyboard(tasks []*domain.Task, page int) *tgbotapi.InlineKeyboardMa
 	// Action row
 	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData("➕ Добавить", "add"),
-		tgbotapi.NewInlineKeyboardButtonData("🔄 Обновить", "refresh:list"),
+		tgbotapi.NewInlineKeyboardButtonData("👩 Ира", "menu:partner"),
+		tgbotapi.NewInlineKeyboardButtonData("🔄", "refresh:list"),
 	))
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
@@ -177,6 +178,7 @@ func mainMenuKeyboard() tgbotapi.InlineKeyboardMarkup {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("📋 Задачи", "menu:list"),
 			tgbotapi.NewInlineKeyboardButtonData("📅 Сегодня", "menu:today"),
+			tgbotapi.NewInlineKeyboardButtonData("👩 Ира", "menu:partner"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🗓 Расписание", "menu:week"),
