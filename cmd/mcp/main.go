@@ -856,6 +856,21 @@ func (s *MCPServer) handleToolsListWithRole(req JSONRPCRequest, role UserRole) J
 			},
 		},
 		{
+			Name:        "familybot_update_task",
+			Description: "Обновить задачу: название, приоритет, дедлайн, тип повторения. Типы повторения: daily (ежедневно), weekdays (Пн-Пт), weekly (раз в неделю), monthly (раз в месяц), '' (без повторения).",
+			InputSchema: InputSchema{
+				Type: "object",
+				Properties: map[string]Property{
+					"task_id":     {Type: "string", Description: "ID задачи (число)"},
+					"title":       {Type: "string", Description: "Новое название (опционально)"},
+					"priority":    {Type: "string", Description: "Новый приоритет: urgent, week, someday (опционально)", Enum: []string{"urgent", "week", "someday"}},
+					"due_date":    {Type: "string", Description: "Новый дедлайн YYYY-MM-DD (опционально)"},
+					"repeat_type": {Type: "string", Description: "Тип повторения: daily, weekdays, weekly, monthly, '' (опционально)", Enum: []string{"", "daily", "weekdays", "weekly", "monthly", "monthly_nth"}},
+				},
+				Required: []string{"task_id"},
+			},
+		},
+		{
 			Name:        "familybot_list_people",
 			Description: "Получить список людей (семья, дети, контакты) с их днями рождения.",
 			InputSchema: InputSchema{Type: "object", Properties: map[string]Property{}},
@@ -1116,6 +1131,22 @@ func (s *MCPServer) handleToolsCallWithRole(req JSONRPCRequest, role UserRole) J
 	case "familybot_delete_task":
 		taskID := fmt.Sprintf("%v", params.Arguments["task_id"])
 		result, isError = s.apiDelete(apiPrefix + "/task/" + taskID)
+	case "familybot_update_task":
+		taskID := fmt.Sprintf("%v", params.Arguments["task_id"])
+		body := make(map[string]interface{})
+		if title, ok := params.Arguments["title"]; ok && title != "" {
+			body["title"] = title
+		}
+		if priority, ok := params.Arguments["priority"]; ok && priority != "" {
+			body["priority"] = priority
+		}
+		if dueDate, ok := params.Arguments["due_date"]; ok && dueDate != "" {
+			body["due_date"] = dueDate
+		}
+		if repeatType, ok := params.Arguments["repeat_type"]; ok && repeatType != "" {
+			body["repeat_type"] = repeatType
+		}
+		result, isError = s.apiPut(apiPrefix+"/task/"+taskID, body)
 	case "familybot_list_people":
 		result, isError = s.apiGet("/api/people") // Same for both
 	case "familybot_list_birthdays":

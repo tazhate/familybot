@@ -601,6 +601,12 @@ func (s *Storage) UpdateTaskDueDate(taskID int64, dueDate *time.Time) error {
 	return err
 }
 
+// UpdateTaskRepeatType updates the repeat type for a task
+func (s *Storage) UpdateTaskRepeatType(taskID int64, repeatType domain.RepeatType) error {
+	_, err := s.db.Exec(`UPDATE tasks SET repeat_type = ? WHERE id = ?`, repeatType, taskID)
+	return err
+}
+
 // ListUrgentTasksForReminder returns urgent tasks that need a reminder
 // Criteria: priority=urgent, not done, created > 2h ago, reminder_count < 3,
 // (snooze_until is null or past), (last_reminded_at is null or > 2h ago)

@@ -370,9 +370,10 @@ func (b *Bot) apiTask(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPut:
 		var req struct {
-			Title    *string `json:"title"`
-			Priority *string `json:"priority"`
-			DueDate  *string `json:"due_date"`
+			Title      *string `json:"title"`
+			Priority   *string `json:"priority"`
+			DueDate    *string `json:"due_date"`
+			RepeatType *string `json:"repeat_type"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			b.jsonError(w, "Invalid JSON", http.StatusBadRequest)
@@ -388,6 +389,14 @@ func (b *Bot) apiTask(w http.ResponseWriter, r *http.Request) {
 
 		if req.Priority != nil {
 			if err := b.taskService.UpdatePriority(taskID, userID, chatID, domain.Priority(*req.Priority)); err != nil {
+				b.jsonError(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		if req.RepeatType != nil {
+			rt := domain.RepeatType(*req.RepeatType)
+			if err := b.storage.UpdateTaskRepeatType(taskID, rt); err != nil {
 				b.jsonError(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
