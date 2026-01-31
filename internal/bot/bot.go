@@ -153,6 +153,9 @@ func (b *Bot) SendMessage(chatID int64, text string) error {
 	msg.ParseMode = "HTML"
 	msg.ReplyMarkup = persistentMenuKeyboard()
 	_, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("SendMessage error (chat %d): %v", chatID, err)
+	}
 	return err
 }
 
@@ -161,6 +164,9 @@ func (b *Bot) SendMessageWithKeyboard(chatID int64, text string, keyboard tgbota
 	msg.ParseMode = "HTML"
 	msg.ReplyMarkup = keyboard
 	_, err := b.api.Send(msg)
+	if err != nil {
+		log.Printf("SendMessageWithKeyboard error (chat %d): %v", chatID, err)
+	}
 	return err
 }
 
