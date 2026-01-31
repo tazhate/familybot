@@ -265,6 +265,11 @@ func (s *TodoistService) todoistToLocalForUser(tt *todoist.Task, userID int64) *
 				task.DueDate = &t
 			}
 		}
+
+		// Preserve recurring flag from Todoist
+		if tt.Due.IsRecurring {
+			task.RepeatType = domain.RepeatWeekly // Generic recurring marker
+		}
 	}
 
 	return task
@@ -345,6 +350,14 @@ func (s *TodoistService) needsUpdateFromTodoist(local *domain.Task, tt *todoist.
 		return true
 	}
 
+	// Check recurring status
+	if tt.Due != nil && tt.Due.IsRecurring && !local.IsRepeating() {
+		return true
+	}
+	if (tt.Due == nil || !tt.Due.IsRecurring) && local.IsRepeating() && local.TodoistID != "" {
+		return true
+	}
+
 	// Check due date
 	if tt.Due != nil {
 		var todoistDue time.Time
@@ -380,8 +393,16 @@ func (s *TodoistService) updateLocalFromTodoist(local *domain.Task, tt *todoist.
 		if !due.IsZero() {
 			local.DueDate = &due
 		}
+
+		// Update recurring status
+		if tt.Due.IsRecurring {
+			local.RepeatType = domain.RepeatWeekly
+		} else {
+			local.RepeatType = domain.RepeatNone
+		}
 	} else {
 		local.DueDate = nil
+		local.RepeatType = domain.RepeatNone
 	}
 }
 

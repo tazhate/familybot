@@ -551,23 +551,52 @@ func (s *TaskService) FormatTaskListWithPersons(tasks []*domain.Task, personName
 		return "Нет задач"
 	}
 
-	var sb strings.Builder
+	// Split into recurring and one-time
+	var recurring, oneTime []*domain.Task
 	for _, t := range tasks {
-		status := "⬜"
-		if t.IsDone() {
-			status = "✅"
+		if t.IsRepeating() {
+			recurring = append(recurring, t)
+		} else {
+			oneTime = append(oneTime, t)
 		}
-		line := fmt.Sprintf("%s %s%s #%d %s", status, t.PriorityEmoji(), t.RepeatEmoji(), t.ID, t.Title)
-		// Show person name if linked
-		if t.PersonID != nil && personNames != nil {
-			if name, ok := personNames[*t.PersonID]; ok {
-				line += fmt.Sprintf(" @%s", name)
-			}
-		}
-		if t.DueDate != nil {
-			line += fmt.Sprintf(" 📅%s", t.DueDate.Format("02.01"))
-		}
-		sb.WriteString(line + "\n")
 	}
+
+	var sb strings.Builder
+
+	// If there are both types, show sections
+	if len(recurring) > 0 && len(oneTime) > 0 {
+		sb.WriteString("<b>📌 Разовые:</b>\n")
+		for _, t := range oneTime {
+			sb.WriteString(s.formatTaskLine(t, personNames))
+		}
+		sb.WriteString("\n<b>🔁 Регулярные:</b>\n")
+		for _, t := range recurring {
+			sb.WriteString(s.formatTaskLine(t, personNames))
+		}
+	} else {
+		// Only one type — show flat list
+		for _, t := range tasks {
+			sb.WriteString(s.formatTaskLine(t, personNames))
+		}
+	}
+
 	return sb.String()
+}
+
+func (s *TaskService) formatTaskLine(t *domain.Task, personNames map[int64]string) string {
+	status := "⬜"
+	if t.IsDone() {
+		status = "✅"
+	}
+	line := fmt.Sprintf("%s %s #%d %s", status, t.PriorityEmoji(), t.ID, t.Title)
+	// Show person name if linked
+	if t.PersonID != nil && personNames != nil {
+		if name, ok := personNames[*t.PersonID]; ok {
+			line += fmt.Sprintf(" @%s", name)
+		}
+	}
+	if t.DueDate != nil {
+		line += fmt.Sprintf(" 📅%s", t.DueDate.Format("02.01"))
+	}
+	return line + "\n"
 }
