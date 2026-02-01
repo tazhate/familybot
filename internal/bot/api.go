@@ -247,7 +247,7 @@ func (b *Bot) apiTasksToday(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := b.cfg.OwnerTelegramID
+	userID := b.ownerInternalID()
 	chatID := userID
 
 	tasks, err := b.taskService.ListForTodayByChat(chatID)
@@ -267,7 +267,7 @@ func (b *Bot) apiTasksShared(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := b.cfg.OwnerTelegramID
+	userID := b.ownerInternalID()
 
 	tasks, err := b.taskService.ListShared(false)
 	if err != nil {
@@ -284,8 +284,8 @@ func (b *Bot) apiTasksShared(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/task/{id} - delete task
 // POST /api/task/{id}/done - mark done
 func (b *Bot) apiTask(w http.ResponseWriter, r *http.Request) {
-	userID := b.cfg.OwnerTelegramID
-	chatID := userID
+	userID := b.ownerInternalID()
+	chatID := b.cfg.OwnerTelegramID
 
 	// Parse task ID from URL
 	path := strings.TrimPrefix(r.URL.Path, "/api/task/")
@@ -438,6 +438,15 @@ func (b *Bot) apiTask(w http.ResponseWriter, r *http.Request) {
 
 // ensurePartnerUser ensures the partner user exists in the database
 // Creates them if they don't exist (similar to autoRegisterUser but for API)
+// ownerInternalID returns the internal DB user ID for the owner.
+// Falls back to TelegramID if user not found (backwards compat).
+func (b *Bot) ownerInternalID() int64 {
+	if user, err := b.storage.GetUserByTelegramID(b.cfg.OwnerTelegramID); err == nil && user != nil {
+		return user.ID
+	}
+	return b.cfg.OwnerTelegramID
+}
+
 func (b *Bot) ensurePartnerUser() (*domain.User, error) {
 	if b.cfg.PartnerTelegramID == 0 {
 		return nil, fmt.Errorf("partner not configured")
@@ -800,7 +809,7 @@ func (b *Bot) apiPartnerTask(w http.ResponseWriter, r *http.Request) {
 // GET /api/people - list people
 // POST /api/people - create person
 func (b *Bot) apiPeople(w http.ResponseWriter, r *http.Request) {
-	userID := b.cfg.OwnerTelegramID
+	userID := b.ownerInternalID()
 
 	switch r.Method {
 	case http.MethodGet:
@@ -869,7 +878,7 @@ func (b *Bot) apiBirthdays(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := b.cfg.OwnerTelegramID
+	userID := b.ownerInternalID()
 
 	persons, err := b.personService.ListUpcomingBirthdays(userID, 60)
 	if err != nil {
@@ -887,7 +896,7 @@ func (b *Bot) apiReminders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := b.cfg.OwnerTelegramID
+	userID := b.ownerInternalID()
 
 	reminders, err := b.reminderService.List(userID)
 	if err != nil {
@@ -905,7 +914,7 @@ func (b *Bot) apiWeek(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := b.cfg.OwnerTelegramID
+	userID := b.ownerInternalID()
 
 	events, err := b.scheduleService.List(userID, true)
 	if err != nil {
@@ -1207,7 +1216,7 @@ func (b *Bot) apiCalendarToday(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := b.cfg.OwnerTelegramID
+	userID := b.ownerInternalID()
 	user, _ := b.storage.GetUserByTelegramID(userID)
 	if user == nil {
 		b.jsonError(w, "User not found", http.StatusNotFound)
@@ -1235,7 +1244,7 @@ func (b *Bot) apiCalendarWeek(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := b.cfg.OwnerTelegramID
+	userID := b.ownerInternalID()
 	user, _ := b.storage.GetUserByTelegramID(userID)
 	if user == nil {
 		b.jsonError(w, "User not found", http.StatusNotFound)
@@ -1322,7 +1331,7 @@ func (b *Bot) apiCalendarEvents(w http.ResponseWriter, r *http.Request) {
 		endTime = startTime
 	}
 
-	userID := b.cfg.OwnerTelegramID
+	userID := b.ownerInternalID()
 	user, _ := b.storage.GetUserByTelegramID(userID)
 	if user == nil {
 		b.jsonError(w, "User not found", http.StatusNotFound)
@@ -1359,7 +1368,7 @@ func (b *Bot) apiCalendarEventDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID := b.cfg.OwnerTelegramID
+	userID := b.ownerInternalID()
 	user, _ := b.storage.GetUserByTelegramID(userID)
 	if user == nil {
 		b.jsonError(w, "User not found", http.StatusNotFound)
